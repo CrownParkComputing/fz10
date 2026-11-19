@@ -198,20 +198,6 @@ struct Game {
 
 /// Lowercase, region tags removed, punctuation folded to spaces: the matching
 /// key for both a game filename and a media filename.
-/// The text of `<tag>…</tag>` in a gamelist block, CDATA unwrapped.
-fn tag_text<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = block.find(&open)? + open.len();
-    let end = block[start..].find(&close)? + start;
-    let text = block.get(start..end)?.trim();
-    Some(
-        text.trim_start_matches("<![CDATA[")
-            .trim_end_matches("]]>")
-            .trim(),
-    )
-}
-
 fn normalize(stem: &str) -> String {
     let mut out = String::with_capacity(stem.len());
     let mut depth = 0i32;
@@ -599,6 +585,12 @@ struct GuiApp {
     /// Whether the model's drawer is out. The machine's own open/close button
     /// toggles it; powering on shuts it.
     fz1_tray_open: bool,
+    /// How far the drawer zoom has come in, 0 to 1: eased toward the tray
+    /// state so the eye closes on the drawer as it opens.
+    drawer_zoom: f32,
+    /// The wheel's own zoom, kept apart from the drawer zoom so the two do
+    /// not fight.
+    fz1_user_zoom: f32,
     /// The disc in the machine, if any.
     game: Option<usize>,
     scaler: Option<gpu_scale::GpuScaler>,
@@ -702,6 +694,8 @@ impl GuiApp {
             setup_root: String::new(),
             setup_media: String::new(),
             fz1_tray_open: true,
+            drawer_zoom: 0.0,
+            fz1_user_zoom: 0.65,
             game: None,
             scaler: None,
             frame_rgba: Vec::new(),
@@ -1098,37 +1092,6 @@ impl GuiApp {
         self.view = View::Machine;
     }
 
-    /// What an EmulationStation `gamelist.xml` says about a game, if the
-    /// library has one beside the discs: how many play, and the blurb.
-    fn gamelist_entry(&self, game: usize) -> Option<(usize, String)> {
-        let stem = self.games.get(game).map(|g| file_stem(&g.path))?;
-        let xml = std::fs::read_to_string(self.cfg.games_dir.join("gamelist.xml")).ok()?;
-        let want = normalize(&stem);
-        for block in xml.split("<game").skip(1) {
-            let path = tag_text(block, "path")?;
-            if normalize(&file_stem(Path::new(path.trim_start_matches("./")))) != want {
-                continue;
-            }
-            let players = tag_text(block, "players")
-                .and_then(|p| {
-                    p.split(['-', '+'])
-                        .filter_map(|n| n.trim().parse::<usize>().ok())
-                        .max()
-                })
-                .unwrap_or(1);
-            let desc = tag_text(block, "desc").unwrap_or_default().to_string();
-            return Some((players.clamp(1, 2), desc));
-        }
-        None
-    }
-
-    /// How many pads a game is played with. The library may say so in a
-    /// `players.conf` beside the discs — `<file stem> = 2` a line — and two
-    /// is the answer when it does not.
-    fn players_for(&self, game: usize) -> usize {
-        self.gamelist_entry(game).map_or(1, |(players, _)| players)
-    }
-
     /// A game's picture from one of the media sets (`box2d`, `boxback`,
     /// `marquee`, `cartridges`…), by path.
     fn media_for(&self, game: &Game, sub: &str) -> Option<PathBuf> {
@@ -1153,35 +1116,6 @@ impl GuiApp {
             let _ = self.cover_tx.send((key, path.to_path_buf()));
         }
         None
-    }
-
-    /// One piece of a game's art drawn into a given box.
-    fn art_at(&mut self, ui: &mut egui::Ui, game: usize, sub: &str, rect: egui::Rect) {
-        let path = self.games.get(game).and_then(|g| self.media_for(g, sub));
-        let press = ui.interact(rect, ui.id().with(("art", sub)), egui::Sense::click());
-        if press.clicked() {
-            self.art_zoom = true;
-        }
-        if press.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let tex = path.and_then(|p| self.art_texture(p.as_path()));
-        let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, PANEL);
-        if let Some(id) = tex {
-            painter.image(
-                id,
-                rect.shrink(3.0),
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        }
-        painter.rect_stroke(
-            rect,
-            4.0,
-            egui::Stroke::new(1.0, TEXT_DIM),
-            StrokeKind::Inside,
-        );
     }
 
     /// The game selector: seven marquees at a time with the chosen one in
@@ -1259,7 +1193,13 @@ impl GuiApp {
                     StrokeKind::Inside,
                 );
                 if press.clicked() && self.fz1_tray_open {
-                    self.selected = index;
+                    // A neighbour walks the shelf; the middle tile is the
+                    // chosen one already, so its click opens the art instead.
+                    if middle && self.selected_game().is_some() {
+                        self.art_zoom = true;
+                    } else {
+                        self.selected = index;
+                    }
                 }
             }
         });
@@ -1375,6 +1315,15 @@ impl GuiApp {
         let step = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1) * 2.0;
         let gap = self.fz1_state.tray_goal - self.fz1_state.tray;
         self.fz1_state.tray += gap.clamp(-step, step);
+
+        // The eye comes in as the drawer opens and backs off as it shuts:
+        // about 0.4 s each way, smoothstepped so it eases at both ends.
+        // `zoom` is a distance multiplier, so in is below 1.0.
+        let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
+        let zoom_goal = if self.fz1_tray_open { 1.0 } else { 0.0 };
+        self.drawer_zoom += (zoom_goal - self.drawer_zoom).clamp(-dt / 0.4, dt / 0.4);
+        let e = self.drawer_zoom * self.drawer_zoom * (3.0 - 2.0 * self.drawer_zoom);
+        self.fz1_state.zoom = (self.fz1_user_zoom * (1.0 - 0.38 * e)).clamp(0.45, 3.0);
         self.fz1_state.spin = self.disc_angle;
         let turn = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
         if self.console_spin {
@@ -1410,7 +1359,8 @@ impl GuiApp {
         if turn.hovered() {
             let wheel = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if wheel != 0.0 {
-                self.fz1_state.zoom = (self.fz1_state.zoom * (1.0 - wheel * 0.002)).clamp(0.45, 3.0);
+                self.fz1_user_zoom =
+                    (self.fz1_user_zoom * (1.0 - wheel * 0.002)).clamp(0.45, 3.0);
             }
         }
 
@@ -1591,9 +1541,8 @@ impl GuiApp {
         self.view_screen(ui, ctx, frame);
     }
 
-    /// The machine, filling the window at one size whatever is going on:
-    /// the mark above it, its billing below, the selector along the bottom
-    /// while the drawer is out, and the chosen game's cover in the margin.
+    /// The machine, filling the window at one size whatever is going on,
+    /// with the selector along the bottom while the drawer is out.
     fn view_machine(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, BG);
@@ -1629,156 +1578,31 @@ impl GuiApp {
         );
     }
 
-    /// Nothing chosen: the machine fills the window the way it does on a
-    /// shelf, under the 3DO mark, over the R·E·A·L line, with a word on what
-    /// to press. All drawn here rather than lifted from the boot screen.
+    /// Nothing on the screen yet: the machine is the whole view, drawn to
+    /// fill the scene while keeping its shape, with only a quiet word on
+    /// what to press floated along the bottom.
     fn view_attract(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame, scene: egui::Rect) {
-        let mark_h = (scene.height() * 0.17).clamp(70.0, 150.0);
-        let foot_h = (scene.height() * 0.17).clamp(70.0, 140.0);
-        let mark = egui::Rect::from_min_size(
-            egui::pos2(scene.min.x, scene.min.y + 6.0),
-            egui::vec2(scene.width(), mark_h),
-        );
-        let deck = egui::Rect::from_min_max(
-            egui::pos2(scene.min.x, mark.max.y),
-            egui::pos2(scene.max.x, scene.max.y - foot_h),
-        );
-        let foot = egui::Rect::from_min_max(
-            egui::pos2(scene.min.x, deck.max.y),
-            egui::pos2(scene.max.x, scene.max.y),
-        );
-
-        self.draw_3do_mark(ui, mark);
-        // The chosen game's box, in the black down the side: a click opens
-        // it, and it goes when the game does.
-        if let Some(game) = self.selected_game() {
-            let width = (scene.width() * 0.11).clamp(90.0, 190.0);
-            let cover = egui::Rect::from_min_size(
-                egui::pos2(scene.min.x + 18.0, deck.center().y - width * 0.72),
-                egui::vec2(width, width * 1.44),
-            );
-            self.art_at(ui, game, "box2d", cover);
-            if let Some((_, desc)) = self.gamelist_entry(game) {
-                if !desc.is_empty() {
-                    let blurb = egui::Rect::from_min_size(
-                        egui::pos2(cover.min.x, cover.max.y + 10.0),
-                        egui::vec2(cover.width(), scene.max.y - cover.max.y - 20.0),
-                    );
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(blurb), |ui| {
-                        ui.label(egui::RichText::new(desc).small().color(TEXT_DIM));
-                    });
-                }
-            }
+        let drawn = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(scene), |ui| {
+                self.draw_fz1(ui, frame, scene)
+            })
+            .inner;
+        if !drawn {
+            ui.painter().rect_filled(scene, 6.0, PANEL);
         }
-        let wide = deck.shrink2(egui::vec2(deck.width() * 0.08, 4.0));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(wide), |ui| {
-            if !self.draw_fz1(ui, frame, wide) {
-                ui.painter().rect_filled(wide, 6.0, PANEL);
-            }
-        });
-        self.draw_real_line(ui, foot);
-    }
-
-    /// The 3DO mark, drawn: a red diamond, a blue square and a yellow disc
-    /// stacked on a white tile, with the letters in a bar beneath it.
-    fn draw_3do_mark(&self, ui: &egui::Ui, rect: egui::Rect) {
-        let painter = ui.painter();
-        let tile_h = (rect.height() * 0.78).clamp(40.0, 130.0);
-        let tile_w = tile_h * 0.62;
-        let tile = egui::Rect::from_center_size(
-            egui::pos2(rect.center().x, rect.min.y + tile_h * 0.5),
-            egui::vec2(tile_w, tile_h),
-        );
-        painter.rect_filled(tile, tile_w * 0.06, egui::Color32::from_rgb(235, 235, 238));
-
-        // Three marks down the tile: diamond, square, disc.
-        let step = tile_h / 3.0;
-        let size = step * 0.62;
-        let centre_x = tile.center().x;
-        let first = tile.min.y + step * 0.5;
-
-        let diamond = egui::pos2(centre_x, first);
-        let half = size * 0.62;
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                egui::pos2(diamond.x, diamond.y - half),
-                egui::pos2(diamond.x + half, diamond.y),
-                egui::pos2(diamond.x, diamond.y + half),
-                egui::pos2(diamond.x - half, diamond.y),
-            ],
-            egui::Color32::from_rgb(206, 26, 32),
-            egui::Stroke::NONE,
-        ));
-
-        painter.rect_filled(
-            egui::Rect::from_center_size(
-                egui::pos2(centre_x, first + step),
-                egui::vec2(size * 1.15, size * 0.92),
-            ),
-            size * 0.08,
-            egui::Color32::from_rgb(26, 22, 150),
-        );
-
-        painter.circle_filled(
-            egui::pos2(centre_x, first + step * 2.0),
-            size * 0.5,
-            egui::Color32::from_rgb(232, 196, 26),
-        );
-
-        // The letters sit in their own dark bar under the tile.
-        let bar = egui::Rect::from_center_size(
-            egui::pos2(centre_x, tile.max.y + tile_h * 0.17),
-            egui::vec2(tile_w * 1.02, tile_h * 0.26),
-        );
-        painter.rect_filled(bar, 1.0, egui::Color32::from_rgb(12, 12, 14));
-        painter.text(
-            bar.center(),
-            egui::Align2::CENTER_CENTER,
-            "3DO",
-            egui::FontId::proportional(bar.height() * 0.78),
-            egui::Color32::from_rgb(238, 238, 242),
-        );
-    }
-
-    /// The R·E·A·L line, the machine's own billing, with a word on what to
-    /// press underneath it.
-    fn draw_real_line(&self, ui: &egui::Ui, rect: egui::Rect) {
-        let painter = ui.painter();
-        let big = (rect.height() * 0.34).clamp(20.0, 46.0);
-        let mid = egui::pos2(rect.center().x, rect.min.y + big * 0.7);
-        painter.text(
-            mid,
-            egui::Align2::CENTER_CENTER,
-            "R·E·A·L",
-            egui::FontId::proportional(big),
-            egui::Color32::from_rgb(226, 228, 236),
-        );
-        painter.text(
-            egui::pos2(mid.x, mid.y + big * 0.8),
-            egui::Align2::CENTER_CENTER,
-            "3DO INTERACTIVE MULTIPLAYER",
-            egui::FontId::proportional(big * 0.36),
-            egui::Color32::from_rgb(170, 174, 186),
-        );
-        painter.text(
-            egui::pos2(mid.x, mid.y + big * 1.45),
-            egui::Align2::CENTER_CENTER,
-            "Panasonic",
-            egui::FontId::proportional(big * 0.5),
-            egui::Color32::from_rgb(90, 120, 225),
-        );
-        painter.text(
-            egui::pos2(mid.x, rect.max.y - big * 0.35),
+        ui.painter().text(
+            egui::pos2(scene.center().x, scene.max.y - 12.0),
             egui::Align2::CENTER_CENTER,
             if self.fz1_tray_open {
                 "pick a disc below, then shut the drawer"
             } else {
                 "press OPEN/CLOSE on the machine to choose a disc"
             },
-            egui::FontId::proportional(big * 0.4),
+            egui::FontId::proportional(12.0),
             TEXT_DIM,
         );
     }
+
 
     /// The picture, once a game is drawing it.
     fn view_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
