@@ -1,0 +1,44 @@
+[package]
+name = "retro3do"
+version = "0.1.0"
+edition = "2021"
+description = "The 3DO Interactive Multiplayer emulation core, in safe Rust, with a C ABI matching retro3do.h"
+license = "MIT"
+default-run = "retro3do-check"
+
+[lib]
+name = "retro3do"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "retro3do-check"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-Rust decoders for the compression codecs CHD uses. No C is linked.
+miniz_oxide = "0.8"
+lzma-rs = "0.3"
+ruzstd = "0.8"
+# Only the headless check tool writes PNG files; the library never does.
+png = "0.17"
+# Only the desktop front ends use SDL3; the library and check tool never do.
+sdl3 = { version = "0.22", features = ["use-pkg-config"] }
+# Only the graphical front end uses these; the library never does.
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+gltf = "1.4.1"
+bytemuck = "1.25.2"
+
+[profile.dev]
+# Guest arithmetic is written with explicit wrapping operations; keeping
+# overflow checks on in tests catches any that are not.
+overflow-checks = true
+opt-level = 1
+
+[profile.test]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
