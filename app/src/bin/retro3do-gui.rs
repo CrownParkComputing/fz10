@@ -1642,6 +1642,17 @@ impl GuiApp {
             self.fz1_state.yaw += turn * 0.7;
         }
         self.fz1_state.lit = running;
+        // The ACCESS lamp only ever shows disc access: it blinks while the
+        // BIOS is still coming up and again while the drawer runs out.
+        let booting = running && !self.picture_live;
+        let ejecting =
+            running && self.fz1_state.tray_goal > 0.5 && self.fz1_state.tray < 0.98;
+        let t = ui.ctx().input(|i| i.time);
+        self.fz1_state.access = if booting || ejecting {
+            ((t * 5.0).fract() < 0.6) as u8 as f32
+        } else {
+            0.0
+        };
 
         let ppt = ui.ctx().pixels_per_point();
         let w = (rect.width() * ppt).round().max(1.0) as u32;

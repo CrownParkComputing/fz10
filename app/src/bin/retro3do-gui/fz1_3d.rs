@@ -369,7 +369,46 @@ fn load_glb(bytes: &[u8]) -> Option<Model> {
     let dy = hi[1] - lo[1];
     let dz = hi[2] - lo[2];
     model.radius = ((dx * dx + dy * dy + dz * dz).sqrt() * 0.5).max(0.05);
+    // The front lamps are not in the GLB: each is an emissive pad tucked a
+    // millimetre behind its button strip and a little wider, so the light
+    // bleeds through the gap around the button the way the real backlit
+    // strips work — nothing lit sits on the face itself. Red behind the
+    // left (power) strip, green behind the right (access) one.
+    model.parts.push(lamp_pad(
+        "ReadyGlow",
+        [-0.11, 0.0553, 0.131],
+        [0.018, 0.006],
+        [0.9, 0.08, 0.03],
+    ));
+    model.parts.push(lamp_pad(
+        "AccessGlow",
+        [0.11, 0.0553, 0.131],
+        [0.018, 0.006],
+        [0.15, 0.95, 0.25],
+    ));
     Some(model)
+}
+
+/// A flat emissive quad, facing out the front of the machine: the light
+/// source behind a button strip. Its own colour is the lamp's; the shader
+/// adds it back at the gain `Fz1State` sets for the lamp.
+fn lamp_pad(name: &str, at: [f32; 3], half: [f32; 2], rgb: [f32; 3]) -> Part {
+    let [hx, hy] = half;
+    let mut verts = Vec::with_capacity(32);
+    for (cx, cy) in [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)] {
+        verts.extend_from_slice(&[cx, cy, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+    Part {
+        name: name.to_string(),
+        local: mat_translate(at),
+        parent: mat_identity(),
+        color: [rgb[0], rgb[1], rgb[2], 1.0],
+        emissive: [1.0, 1.0, 1.0],
+        textured: false,
+        centre: [0.0; 3],
+        verts,
+        indices: vec![0, 1, 2, 0, 2, 3],
+    }
 }
 
 // --- gpu renderer ----------------------------------------------------------
@@ -475,6 +514,10 @@ pub struct Fz1State {
     pub pad_pitch: f32,
     /// Power/ready lamps lit.
     pub lit: bool,
+    /// The ACCESS lamp's level, 0..1. It stays dark while the machine idles
+    /// and the GUI blinks it while the BIOS comes up or the drawer runs
+    /// out — disc access is the only thing it ever shows.
+    pub access: f32,
 }
 
 const DISC_TEX_SIZE: u32 = 1024;
@@ -897,12 +940,10 @@ impl Fz1Renderer {
                     view: color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.46,
-                            g: 0.47,
-                            b: 0.52,
-                            a: 1.0,
-                        }),
+                        // Clear transparent, not to a page grey: the GUI's
+                        // own wallpaper shows through wherever the machine
+                        // isn't drawn.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -940,11 +981,32 @@ impl Fz1Renderer {
                     world = mat_mul(&world, &mat_rot_y(anim.spin));
                 }
                 let mvp = mat_mul(&vp, &world);
-                let emissive = if anim.lit { 1.5 } else { 0.0 };
+                // The lamps are driven by name: READY holds while the
+                // machine is powered, ACCESS follows the level the GUI
+                // sets, and the little face lenses the GLB carries stay
+                // dark — on this front the light lives behind the strips.
+                let gain = match part.name.as_str() {
+                    "ReadyLamp" | "AccessLamp" => 0.0,
+                    "ReadyGlow" => {
+                        if anim.lit {
+                            2.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    "AccessGlow" => anim.access.clamp(0.0, 1.0) * 3.0,
+                    _ => {
+                        if anim.lit {
+                            1.5
+                        } else {
+                            0.0
+                        }
+                    }
+                };
                 let params = [
                     if part.textured { 1.0 } else { 0.0 },
                     if part.emissive.iter().any(|e| *e > 0.01) {
-                        emissive
+                        gain
                     } else {
                         0.0
                     },
