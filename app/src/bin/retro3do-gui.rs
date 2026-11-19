@@ -13,6 +13,8 @@
     clippy::indexing_slicing
 )]
 
+#[path = "retro3do-gui/boot_logo.rs"]
+mod boot_logo;
 #[path = "retro3do-gui/fz1_3d.rs"]
 mod fz1_3d;
 #[path = "retro3do-gui/gpu_scale.rs"]
@@ -51,6 +53,10 @@ const ACCENTS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(200, 200, 90),
     egui::Color32::from_rgb(150, 110, 90),
 ];
+
+/// The texture-cache key the extracted boot logo arrives under (see
+/// `boot_logo.rs`). It is not a media path, so it is never re-asked for.
+const LOGO_KEY: &str = "__boot_logo__";
 
 const BG: egui::Color32 = egui::Color32::from_rgb(14, 14, 20);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 22, 32);
@@ -147,12 +153,19 @@ impl Config {
         let configured = cfg.load_settings();
         cfg.configured = configured;
         let mut args = std::env::args().skip(1);
+        let mut dirs_set = false;
         while let Some(arg) = args.next() {
             let value = args.next().ok_or_else(|| format!("{arg} wants a value"))?;
             match arg.as_str() {
-                "--games-dir" => cfg.games_dir = PathBuf::from(value),
+                "--games-dir" => {
+                    cfg.games_dir = PathBuf::from(value);
+                    dirs_set = true;
+                }
                 "--media-dir" => cfg.media_dir = PathBuf::from(value),
-                "--bios-dir" => cfg.bios_dir = PathBuf::from(value),
+                "--bios-dir" => {
+                    cfg.bios_dir = PathBuf::from(value);
+                    dirs_set = true;
+                }
                 "--saves-dir" => cfg.saves_dir = PathBuf::from(value),
                 "--docs-dir" => cfg.docs_dir = PathBuf::from(value),
                 "--texdir" => cfg.texdir = Some(PathBuf::from(value)),
@@ -176,6 +189,9 @@ impl Config {
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
+        // Handed real paths on the command line counts as configured: the
+        // walkthrough is for someone who has never run this before.
+        cfg.configured = cfg.configured || dirs_set;
         Ok(cfg)
     }
 }
@@ -386,6 +402,19 @@ fn scan_bios(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
+/// `.bin`/`.rom` files at least 256 KiB — the sizes real 3DO ROMs come in,
+/// which is what the walkthrough checks a BIOS folder for.
+fn bios_candidates(dir: &Path) -> Vec<PathBuf> {
+    scan_dir(dir, &["bin", "rom"])
+        .into_iter()
+        .filter(|p| {
+            p.metadata()
+                .map(|m| m.len() >= 256 * 1024)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // SDL3: audio device stream and gamepads (no video — egui owns the window)
 
@@ -546,6 +575,9 @@ struct GuiApp {
     covers: HashMap<String, TextureHandle>,
     covers_rx: Receiver<(String, ColorImage)>,
     cover_tx: Sender<(String, PathBuf)>,
+    /// The decode thread's answer channel, kept so the logo extraction can
+    /// post its image the same way.
+    result_tx: Sender<(String, ColorImage)>,
     pending_images: Vec<(String, ColorImage)>,
     frame_tex: Option<TextureHandle>,
     /// The FZ-1 in three dimensions: the model as loaded, the GPU renderer
@@ -573,15 +605,28 @@ struct GuiApp {
     console_spin: bool,
     /// A game waiting for the drawer to shut before it goes in.
     pending_start: Option<usize>,
-    /// The field count when the disc went in, and whether the picture has
-    /// anything in it yet: the machine stays on screen until the game is
-    /// actually drawing, however long the disc takes to get there.
-    boot_frames: Option<u64>,
+    /// Whether the machine's picture has anything in it yet: the console
+    /// stays on screen until the core is actually drawing, then slides and
+    /// fades out over about half a second (`console_fade` 1.0 = console
+    /// fully on top, 0.0 = gone).
     picture_live: bool,
-    /// The walkthrough's step and the paths being typed into it.
+    console_fade: f32,
+    /// The size of the field captured this repaint, if the core published
+    /// one; `view_screen` reads it instead of asking for a frame itself.
+    frame_dims: Option<(usize, usize)>,
+    /// The walkthrough's step and the paths being typed into it, plus the
+    /// directory picker (`picker` is the folder being browsed, `picker_step`
+    /// which step's field it belongs to).
     setup_step: usize,
-    setup_root: String,
+    setup_bios: String,
+    setup_games: String,
     setup_media: String,
+    picker: Option<PathBuf>,
+    picker_step: usize,
+    /// When the window opened, and until when the boot-logo splash holds the
+    /// screen once the extracted artwork has arrived.
+    launched: Instant,
+    splash_until: Option<Instant>,
     /// Whether the model's drawer is out. The machine's own open/close button
     /// toggles it; powering on shuts it.
     fz1_tray_open: bool,
@@ -624,6 +669,7 @@ impl GuiApp {
         // and receives (key, image) results for the texture cache.
         let (job_tx, job_rx) = channel::<(String, PathBuf)>();
         let (tx, rx) = channel::<(String, ColorImage)>();
+        let result_tx = tx.clone();
         std::thread::spawn(move || {
             for (key, path) in job_rx {
                 if let Ok(img) = image::open(&path) {
@@ -666,6 +712,7 @@ impl GuiApp {
             covers: HashMap::new(),
             covers_rx: rx,
             cover_tx: job_tx,
+            result_tx,
             pending_images: Vec::new(),
             frame_tex: None,
             fz1_scene: Vec::new(),
@@ -688,11 +735,17 @@ impl GuiApp {
             art_zoom: false,
             console_spin: false,
             pending_start: None,
-            boot_frames: None,
             picture_live: false,
+            console_fade: 1.0,
+            frame_dims: None,
             setup_step: 0,
-            setup_root: String::new(),
-            setup_media: String::new(),
+            setup_bios: cfg.bios_dir.to_string_lossy().into_owned(),
+            setup_games: cfg.games_dir.to_string_lossy().into_owned(),
+            setup_media: cfg.media_dir.to_string_lossy().into_owned(),
+            picker: None,
+            picker_step: 0,
+            launched: Instant::now(),
+            splash_until: None,
             fz1_tray_open: true,
             drawer_zoom: 0.0,
             fz1_user_zoom: 0.65,
@@ -708,9 +761,6 @@ impl GuiApp {
         };
         app.refresh_covers();
         app.apply_textures();
-        if !app.cfg.configured {
-            app.view = View::Setup;
-        }
         // Powered off with an empty drawer, which is how a 3DO sits until
         // someone puts something in it.
         app.game = None;
@@ -718,6 +768,14 @@ impl GuiApp {
         if app.bios_choice.is_none() {
             app.bios_choice = app.cfg.bios_choice.clone().or_else(|| app.bioses.first().cloned());
         }
+        // The walkthrough appears when there is nothing remembered, and
+        // again when what is remembered no longer has a BIOS to boot.
+        if !app.cfg.configured || app.bioses.is_empty() {
+            app.view = View::Setup;
+        }
+        // The real boot logo, pulled out of the chosen BIOS by the core
+        // itself, arrives on the artwork channel like any other picture.
+        app.extract_logo();
         if let Some(b) = app.cfg.boot {
             if b < app.games.len() {
                 app.insert_disc(b);
@@ -805,7 +863,6 @@ impl GuiApp {
         self.game = None;
         self.fz1_tray_open = true;
         self.pending_start = None;
-        self.boot_frames = None;
         self.picture_live = false;
         self.status = "disc out — the BIOS is waiting".to_string();
         self.view = View::Machine;
@@ -839,6 +896,7 @@ impl GuiApp {
             self.emu.set_region(Region::Pal);
         }
         self.emu.start();
+        self.picture_live = false;
         self.fz1_tray_open = false;
         self.status.clear();
         self.view = View::Machine;
@@ -848,6 +906,7 @@ impl GuiApp {
     fn power_off(&mut self) {
         self.emu.stop();
         self.save_nvram();
+        self.picture_live = false;
         self.view = View::Machine;
     }
 
@@ -877,24 +936,42 @@ impl GuiApp {
     }
 
 
-    /// First run: ask where the 3DO library lives, then which BIOS to boot.
-    /// Everything it collects is written to the settings file, so it only
-    /// appears again if that file goes away.
+    /// One row of the walkthrough: a label, a path that can be typed, and a
+    /// browse button that opens the folder picker for this step.
+    fn setup_path_row(&mut self, ui: &mut egui::Ui, label: &str, step: usize) {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let field = match step {
+                1 => &mut self.setup_bios,
+                2 => &mut self.setup_games,
+                _ => &mut self.setup_media,
+            };
+            ui.add(egui::TextEdit::singleline(field).desired_width(340.0));
+            if ui.button("browse…").clicked() {
+                let start = field.trim();
+                let start = PathBuf::from(if start.is_empty() {
+                    std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+                } else {
+                    start.to_string()
+                });
+                self.picker = Some(if start.is_dir() {
+                    start
+                } else {
+                    start.parent().map(Path::to_path_buf).unwrap_or(start)
+                });
+                self.picker_step = step;
+            }
+        });
+    }
+
+    /// First run: welcome, then where the BIOS, the discs and the artwork
+    /// live. Everything it collects is written to the settings file, so it
+    /// only appears again if that file goes away or the BIOS folder empties.
     fn view_setup(&mut self, ui: &mut egui::Ui) {
-        if self.setup_root.is_empty() {
-            self.setup_root = self
-                .cfg
-                .games_dir
-                .parent()
-                .unwrap_or(&self.cfg.games_dir)
-                .to_string_lossy()
-                .into_owned();
-            self.setup_media = self.cfg.media_dir.to_string_lossy().into_owned();
-        }
         let rect = ui.available_rect_before_wrap();
         let card = egui::Rect::from_center_size(
             rect.center(),
-            egui::vec2(rect.width().min(620.0), rect.height().min(420.0)),
+            egui::vec2(rect.width().min(620.0), rect.height().min(440.0)),
         );
         ui.painter().rect(
             card,
@@ -909,49 +986,104 @@ impl GuiApp {
                 ui.vertical(|ui| {
                     ui.heading("Set up RETRO 3DO");
                     ui.add_space(4.0);
+                    let bios_dir = PathBuf::from(self.setup_bios.trim());
+                    let games_dir = PathBuf::from(self.setup_games.trim());
+                    let bioses = bios_candidates(&bios_dir);
+                    let mut can_next = true;
                     match self.setup_step {
                         0 => {
+                            ui.add_space(10.0);
                             ui.label(
-                                "Where does your 3DO library live? The folder that holds \
-                                 the discs, the BIOS images and the saves.",
+                                "Welcome. A few quick questions and the machine is \
+                                 yours: where your BIOS image lives, where your \
+                                 discs are, and (if you like) where their artwork \
+                                 is kept.",
                             );
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                ui.label("library");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.setup_root)
-                                        .desired_width(380.0),
-                                );
-                            });
-                            let root = PathBuf::from(self.setup_root.trim());
-                            let games = root.join("games");
-                            let bios = root.join("bios");
-                            ui.add_space(6.0);
+                            ui.add_space(10.0);
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "discs: {}   ·   bios: {}",
-                                    if games.is_dir() { "found" } else { "not there yet" },
-                                    if bios.is_dir() { "found" } else { "not there yet" },
-                                ))
+                                egui::RichText::new(
+                                    "You will need a real 3DO BIOS ROM — the emulator \
+                                     cannot boot retail discs without one.",
+                                )
                                 .small()
                                 .color(TEXT_DIM),
                             );
                         }
                         1 => {
                             ui.label(
-                                "Where is the artwork? Box fronts, backs, marquees and \
-                                 disc labels are read from here.",
+                                "Where is your 3DO BIOS? It is the ROM dumped from a \
+                                 real console — a .bin or .rom file around 1 MB.",
                             );
                             ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                ui.label("artwork");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.setup_media)
-                                        .desired_width(380.0),
-                                );
-                            });
-                            let media = PathBuf::from(self.setup_media.trim());
+                            self.setup_path_row(ui, "bios folder", 1);
                             ui.add_space(6.0);
+                            if bioses.is_empty() {
+                                can_next = false;
+                                ui.label(
+                                    egui::RichText::new(
+                                        "no BIOS images here — point me at the folder \
+                                         that holds one",
+                                    )
+                                    .small()
+                                    .color(egui::Color32::from_rgb(230, 110, 110)),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} BIOS image(s) found: {}",
+                                        bioses.len(),
+                                        bioses
+                                            .iter()
+                                            .map(|p| file_stem(p))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(110, 210, 130)),
+                                );
+                            }
+                        }
+                        2 => {
+                            ui.label(
+                                "Where are your games? Disc images (.chd, .iso, \
+                                 .cue) are read straight from this folder.",
+                            );
+                            ui.add_space(8.0);
+                            self.setup_path_row(ui, "games folder", 2);
+                            ui.add_space(6.0);
+                            if !games_dir.is_dir() {
+                                can_next = false;
+                                ui.label(
+                                    egui::RichText::new("that folder does not exist")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(230, 110, 110)),
+                                );
+                            } else {
+                                let discs =
+                                    scan_dir(&games_dir, &["chd", "iso", "cue", "bin", "img"])
+                                        .len();
+                                ui.label(
+                                    egui::RichText::new(if discs > 0 {
+                                        format!("{discs} disc image(s) found")
+                                    } else {
+                                        "folder found — no discs in it yet, that is fine"
+                                            .to_string()
+                                    })
+                                    .small()
+                                    .color(TEXT_DIM),
+                                );
+                            }
+                        }
+                        3 => {
+                            ui.label(
+                                "Where is the artwork? Box fronts, backs, marquees \
+                                 and disc labels are read from here. Optional — \
+                                 skip it and the library just stays plain.",
+                            );
+                            ui.add_space(8.0);
+                            self.setup_path_row(ui, "artwork", 3);
+                            ui.add_space(6.0);
+                            let media = PathBuf::from(self.setup_media.trim());
                             ui.label(
                                 egui::RichText::new(if media.join("box2d").is_dir() {
                                     "covers found"
@@ -963,31 +1095,46 @@ impl GuiApp {
                             );
                         }
                         _ => {
-                            ui.label("Which BIOS should the machine boot?");
+                            ui.label("All set. This is what the machine will use:");
                             ui.add_space(8.0);
-                            egui::ScrollArea::vertical()
-                                .max_height(200.0)
-                                .show(ui, |ui| {
-                                    for b in self.bioses.clone() {
-                                        if ui
-                                            .selectable_label(
-                                                self.bios_choice.as_deref() == Some(b.as_str()),
-                                                &b,
-                                            )
-                                            .clicked()
-                                        {
-                                            self.bios_choice = Some(b.clone());
-                                        }
-                                    }
+                            for (label, path) in [
+                                ("bios", bios_dir.clone()),
+                                ("games", games_dir.clone()),
+                                (
+                                    "artwork",
+                                    PathBuf::from(self.setup_media.trim()),
+                                ),
+                            ] {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{label:>7}")).monospace(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(if path.as_os_str().is_empty() {
+                                            "—".to_string()
+                                        } else {
+                                            path.display().to_string()
+                                        })
+                                        .small()
+                                        .color(TEXT_DIM),
+                                    );
                                 });
-                            if self.bioses.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "no BIOS images in the library's bios folder",
-                                    )
-                                    .small()
-                                    .color(TEXT_DIM),
-                                );
+                            }
+                            if bioses.len() > 1 {
+                                ui.add_space(8.0);
+                                ui.label("Which BIOS should it boot?");
+                                for b in &bioses {
+                                    let name = file_stem(b);
+                                    if ui
+                                        .selectable_label(
+                                            self.bios_choice.as_deref() == Some(name.as_str()),
+                                            &name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.bios_choice = Some(name.clone());
+                                    }
+                                }
                             }
                         }
                     }
@@ -997,17 +1144,30 @@ impl GuiApp {
                         if self.setup_step > 0 && ui.button("back").clicked() {
                             self.setup_step -= 1;
                         }
-                        let last = self.setup_step >= 2;
-                        if ui.button(if last { "finish" } else { "next" }).clicked() {
+                        if self.setup_step == 3 && ui.button("skip").clicked() {
+                            self.setup_media.clear();
+                            self.setup_step += 1;
+                        }
+                        let last = self.setup_step >= 4;
+                        let label = if last {
+                            "finish"
+                        } else if self.setup_step == 0 {
+                            "get started"
+                        } else {
+                            "next"
+                        };
+                        if ui
+                            .add_enabled(can_next, egui::Button::new(label))
+                            .clicked()
+                        {
                             if last {
                                 self.finish_setup();
                             } else {
-                                self.apply_setup_paths();
                                 self.setup_step += 1;
                             }
                         }
                         ui.label(
-                            egui::RichText::new(format!("step {} of 3", self.setup_step + 1))
+                            egui::RichText::new(format!("step {} of 5", self.setup_step + 1))
                                 .small()
                                 .color(TEXT_DIM),
                         );
@@ -1015,6 +1175,88 @@ impl GuiApp {
                 });
             },
         );
+    }
+
+    /// The folder browser the walkthrough opens for each path it asks for.
+    /// Directories only: click one to descend into it, "use this folder"
+    /// takes the one being browsed.
+    fn dir_picker_overlay(&mut self, ctx: &egui::Context) {
+        let Some(current) = self.picker.clone() else {
+            return;
+        };
+        egui::Area::new(egui::Id::new("dir-picker"))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(190));
+                let card = egui::Rect::from_center_size(
+                    screen.center(),
+                    egui::vec2(screen.width().min(560.0), screen.height().min(430.0)),
+                );
+                ui.painter().rect(
+                    card,
+                    10.0,
+                    PANEL,
+                    egui::Stroke::new(1.0, TEXT_DIM),
+                    StrokeKind::Inside,
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(card.shrink(16.0)),
+                    |ui| {
+                        ui.label(egui::RichText::new(current.display().to_string()).monospace());
+                        ui.add_space(6.0);
+                        let mut dirs: Vec<PathBuf> = Vec::new();
+                        if let Ok(read) = std::fs::read_dir(&current) {
+                            for entry in read.flatten() {
+                                let path = entry.path();
+                                if path.is_dir()
+                                    && !entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .starts_with('.')
+                                {
+                                    dirs.push(path);
+                                }
+                            }
+                        }
+                        dirs.sort();
+                        egui::ScrollArea::vertical()
+                            .max_height(card.height() - 110.0)
+                            .show(ui, |ui| {
+                                if let Some(parent) = current.parent() {
+                                    if ui.selectable_label(false, "..  (up)").clicked() {
+                                        self.picker = Some(parent.to_path_buf());
+                                    }
+                                }
+                                for dir in dirs {
+                                    let name = dir
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    if ui.selectable_label(false, name).clicked() {
+                                        self.picker = Some(dir);
+                                    }
+                                }
+                            });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("use this folder").clicked() {
+                                let field = match self.picker_step {
+                                    1 => &mut self.setup_bios,
+                                    2 => &mut self.setup_games,
+                                    _ => &mut self.setup_media,
+                                };
+                                *field = current.to_string_lossy().into_owned();
+                                self.picker = None;
+                            }
+                            if ui.button("cancel").clicked() {
+                                self.picker = None;
+                            }
+                        });
+                    },
+                );
+            });
     }
 
     /// Both covers, opened up side by side over the picture. A click puts
@@ -1060,30 +1302,58 @@ impl GuiApp {
             });
     }
 
-    /// Put the typed paths into the live config and rescan what is there.
-    fn apply_setup_paths(&mut self) {
-        let root = PathBuf::from(self.setup_root.trim());
-        if root.as_os_str().is_empty() {
+    /// Pull the boot logo out of the chosen BIOS on a worker thread and send
+    /// it to the texture cache like any other artwork.
+    fn extract_logo(&self) {
+        let Some(bios) = self.bios_choice.clone() else {
             return;
+        };
+        let mut path = self.cfg.bios_dir.join(format!("{bios}.bin"));
+        if !path.exists() {
+            path = self.cfg.bios_dir.join(&bios);
         }
-        self.cfg.games_dir = root.join("games");
-        self.cfg.bios_dir = root.join("bios");
-        self.cfg.saves_dir = root.join("saves");
-        let media = PathBuf::from(self.setup_media.trim());
-        if !media.as_os_str().is_empty() {
-            self.cfg.media_dir = media;
-        }
-        self.games = scan_games(&self.cfg);
-        self.bioses = scan_bios(&self.cfg);
-        if self.bios_choice.is_none() {
-            self.bios_choice = self.bioses.first().cloned();
-        }
-        self.refresh_covers();
+        let tx = self.result_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(img) = boot_logo::extract(&path) {
+                let _ = tx.send((LOGO_KEY.to_string(), img));
+            }
+        });
     }
 
     /// Remember the answers and open the machine.
     fn finish_setup(&mut self) {
-        self.apply_setup_paths();
+        let games_dir = PathBuf::from(self.setup_games.trim());
+        self.cfg.bios_dir = PathBuf::from(self.setup_bios.trim());
+        self.cfg.saves_dir = games_dir
+            .parent()
+            .map(|p| p.join("saves"))
+            .unwrap_or_else(|| games_dir.join("saves"));
+        let media = PathBuf::from(self.setup_media.trim());
+        self.cfg.media_dir = if media.as_os_str().is_empty() {
+            games_dir
+                .parent()
+                .map(|p| p.join("media"))
+                .unwrap_or_else(|| games_dir.join("media"))
+        } else {
+            media
+        };
+        self.cfg.games_dir = games_dir;
+        self.games = scan_games(&self.cfg);
+        self.bioses = scan_bios(&self.cfg);
+        if self
+            .bios_choice
+            .as_ref()
+            .is_none_or(|b| !self.bioses.contains(b))
+        {
+            self.bios_choice = self
+                .bioses
+                .iter()
+                .find(|b| b.contains("panafz10"))
+                .or_else(|| self.bioses.first())
+                .cloned();
+        }
+        self.refresh_covers();
+        self.extract_logo();
         self.cfg.bios_choice = self.bios_choice.clone();
         match self.cfg.save_settings() {
             Ok(()) => self.status = "setup saved".to_string(),
@@ -1103,6 +1373,25 @@ impl GuiApp {
     /// The disc-label picture: the art that belongs on a disc.
     fn disc_label(&self, game: &Game) -> Option<PathBuf> {
         self.media_for(game, "cartridges")
+    }
+
+    /// The extracted boot logo, letterboxed at `fill` of the area's height.
+    /// Returns whether it painted — it is only there once the extraction
+    /// thread has sent it in.
+    fn paint_logo(&self, ui: &egui::Ui, area: egui::Rect, fill: f32) -> bool {
+        let Some(tex) = self.covers.get(LOGO_KEY) else {
+            return false;
+        };
+        let size = tex.size_vec2();
+        let scale = (area.height() * fill / size.y.max(1.0)).min(area.width() * 0.9 / size.x.max(1.0));
+        let dst = egui::Rect::from_center_size(area.center(), size * scale);
+        ui.painter().image(
+            tex.id(),
+            dst,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        true
     }
 
     /// The texture for a media path, asking the decode thread for it the
@@ -1246,15 +1535,21 @@ impl GuiApp {
             if !self.emu.running() {
                 self.power_on();
             }
-            self.boot_frames = Some(self.emu.stats().frames_emulated);
-            self.picture_live = false;
         }
     }
 
     /// Paint the FZ-1 model into `rect`, returning whether it drew. The model
     /// loads on first use and the renderer is built from egui's own wgpu
-    /// device, so it shares the window's surface.
-    fn draw_fz1(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame, rect: egui::Rect) -> bool {
+    /// device, so it shares the window's surface. `fade` below 1.0 is the
+    /// console leaving as the game takes over: it sinks and goes see-through,
+    /// and its controls stop answering.
+    fn draw_fz1(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &mut eframe::Frame,
+        rect: egui::Rect,
+        fade: f32,
+    ) -> bool {
         if !self.fz1_tried {
             self.fz1_tried = true;
             if let Some(console) = fz1_3d::load_model() {
@@ -1338,12 +1633,18 @@ impl GuiApp {
         else {
             return false;
         };
+        let at = rect.translate(egui::vec2(0.0, (1.0 - fade) * rect.height() * 0.18));
         ui.painter().image(
             tex,
-            rect,
+            at,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
+            egui::Color32::WHITE.gamma_multiply(fade.clamp(0.0, 1.0)),
         );
+        if fade < 0.999 {
+            // Leaving or arriving: the machine is scenery, not a control.
+            ui.ctx().request_repaint();
+            return true;
+        }
 
         // Turn it with a drag, come closer with the wheel.
         let turn = ui.interact(
@@ -1435,10 +1736,19 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         while let Ok((key, img)) = self.covers_rx.try_recv() {
+            if key == LOGO_KEY
+                && self.splash_until.is_none()
+                && self.launched.elapsed() < Duration::from_secs(4)
+                && self.cfg.boot.is_none()
+                && self.cfg.play.is_none()
+            {
+                self.splash_until = Some(Instant::now() + Duration::from_millis(1800));
+            }
             self.pending_images.push((key, img));
         }
         self.upload_pending(&ctx);
         self.push_pads(&ctx);
+        self.poll_frame();
 
         // Disc spin: full speed while the machine runs, a slow show-off turn
         // while a disc just sits in the tray.
@@ -1517,6 +1827,25 @@ impl eframe::App for GuiApp {
             View::Setup => self.view_setup(ui),
             View::Machine => self.view_picture(ui, &ctx, frame),
         });
+
+        if self.picker.is_some() {
+            self.dir_picker_overlay(&ctx);
+        }
+        if let Some(until) = self.splash_until {
+            if Instant::now() < until {
+                egui::Area::new(egui::Id::new("boot-splash"))
+                    .order(egui::Order::Foreground)
+                    .show(&ctx, |ui| {
+                        let screen = ctx.content_rect();
+                        ui.painter()
+                            .rect_filled(screen, 0.0, egui::Color32::BLACK);
+                        self.paint_logo(ui, screen, 0.85);
+                    });
+                ctx.request_repaint();
+            } else {
+                self.splash_until = None;
+            }
+        }
     }
 }
 
@@ -1524,21 +1853,64 @@ impl eframe::App for GuiApp {
 // Views
 
 impl GuiApp {
-    /// The main area: the machine with its disc and pad until a game is
-    /// drawing, the picture once it is.
-    fn view_picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let booting = match self.boot_frames {
-            Some(start) => {
-                !self.picture_live || self.emu.stats().frames_emulated < start + 60
+    /// Grab the newest native field and note whether anything real is being
+    /// drawn. Runs every repaint while the machine is on — the console's
+    /// departure is keyed off `picture_live`, so waiting for the picture view
+    /// to ask would mean it never happened.
+    fn poll_frame(&mut self) {
+        self.frame_dims = None;
+        if !self.emu.running() {
+            return;
+        }
+        let mut lit = false;
+        self.emu.acquire_frame(|pixels, w, h| {
+            self.frame_rgba.clear();
+            self.frame_rgba
+                .resize(w.saturating_mul(h).saturating_mul(4), 0);
+            for (px, dst) in pixels.iter().zip(self.frame_rgba.as_chunks_mut::<4>().0) {
+                let [_, r, g, b] = px.to_be_bytes(); // XRGB -> RGBA
+                *dst = [r, g, b, 255];
             }
-            None => false,
-        };
-        let playing = self.game.is_some() && self.emu.running() && !booting;
-        if !playing {
+            self.frame_dims = Some((w, h));
+            // Anything other than a black field counts as the game drawing.
+            lit = self
+                .frame_rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .step_by(97)
+                .any(|px| {
+                    px.first().copied().unwrap_or(0) as u32
+                        + px.get(1).copied().unwrap_or(0) as u32
+                        + px.get(2).copied().unwrap_or(0) as u32
+                        > 90
+                });
+        });
+        if lit {
+            self.picture_live = true;
+        }
+    }
+
+    /// The main area: the machine with its disc and pad until the core is
+    /// drawing, then the machine slides away and the picture has the window.
+    fn view_picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let live = self.game.is_some() && self.emu.running() && self.picture_live;
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        let goal = if live { 0.0 } else { 1.0 };
+        self.console_fade += (goal - self.console_fade).clamp(-dt / 0.5, dt / 0.5);
+        if !live && self.console_fade >= 0.999 {
             self.view_machine(ui, frame);
             return;
         }
         self.view_screen(ui, ctx, frame);
+        if self.console_fade > 0.001 {
+            // Mid-crossing: the machine sinks away over the new picture.
+            let area = ui.available_rect_before_wrap();
+            ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                self.draw_fz1(ui, frame, area, self.console_fade);
+            });
+            ctx.request_repaint();
+        }
     }
 
     /// The machine, filling the window at one size whatever is going on,
@@ -1584,7 +1956,7 @@ impl GuiApp {
     fn view_attract(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame, scene: egui::Rect) {
         let drawn = ui
             .scope_builder(egui::UiBuilder::new().max_rect(scene), |ui| {
-                self.draw_fz1(ui, frame, scene)
+                self.draw_fz1(ui, frame, scene, 1.0)
             })
             .inner;
         if !drawn {
@@ -1625,36 +1997,8 @@ impl GuiApp {
             }
             return;
         }
-        // The newest native field, converted to RGBA for the GPU upload.
-        let mut dims: Option<(usize, usize)> = None;
-        let mut picture_lit = false;
-        self.emu.acquire_frame(|pixels, w, h| {
-            self.frame_rgba.clear();
-            self.frame_rgba
-                .resize(w.saturating_mul(h).saturating_mul(4), 0);
-            for (px, dst) in pixels.iter().zip(self.frame_rgba.as_chunks_mut::<4>().0) {
-                let [_, r, g, b] = px.to_be_bytes(); // XRGB -> RGBA
-                *dst = [r, g, b, 255];
-            }
-            dims = Some((w, h));
-            // Anything other than a black field counts as the game drawing.
-            let lit = self
-                .frame_rgba
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .step_by(97)
-                .any(|px| {
-                    px.first().copied().unwrap_or(0) as u32
-                        + px.get(1).copied().unwrap_or(0) as u32
-                        + px.get(2).copied().unwrap_or(0) as u32
-                        > 90
-                });
-            picture_lit = lit;
-        });
-        if picture_lit {
-            self.picture_live = true;
-        }
+        // The newest field was already captured by `poll_frame` this repaint.
+        let dims = self.frame_dims;
 
         // Upscale on the GPU straight to the size the frame will occupy on
         // screen, so every preset's internal scale lands on real pixels
@@ -1734,6 +2078,10 @@ impl GuiApp {
                     egui::Color32::WHITE,
                 );
             }
+        } else {
+            // Booting: nothing from the core yet, so hold the real logo on
+            // the screen the way the machine would.
+            self.paint_logo(ui, rect, 0.85);
         }
 
         // Overlay chrome appears when the pointer moves near the top, and keys
