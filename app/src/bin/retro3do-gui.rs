@@ -58,6 +58,10 @@ const ACCENTS: [egui::Color32; 8] = [
 /// `boot_logo.rs`). It is not a media path, so it is never re-asked for.
 const LOGO_KEY: &str = "__boot_logo__";
 
+/// The 3DO badge in the cache: the tile the machine view's wallpaper is
+/// made of.
+const WALL_KEY: &str = "__3do_mark__";
+
 const BG: egui::Color32 = egui::Color32::from_rgb(14, 14, 20);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(22, 22, 32);
 const CARD: egui::Color32 = egui::Color32::from_rgb(28, 28, 40);
@@ -627,6 +631,8 @@ struct GuiApp {
     /// screen once the extracted artwork has arrived.
     launched: Instant,
     splash_until: Option<Instant>,
+    /// How far the badge wallpaper has drifted, in points.
+    wall_drift: f32,
     /// Whether the model's drawer is out. The machine's own open/close button
     /// toggles it; powering on shuts it.
     fz1_tray_open: bool,
@@ -746,6 +752,7 @@ impl GuiApp {
             picker_step: 0,
             launched: Instant::now(),
             splash_until: None,
+            wall_drift: 0.0,
             fz1_tray_open: true,
             drawer_zoom: 0.0,
             fz1_user_zoom: 0.65,
@@ -772,6 +779,16 @@ impl GuiApp {
         // again when what is remembered no longer has a BIOS to boot.
         if !app.cfg.configured || app.bioses.is_empty() {
             app.view = View::Setup;
+        }
+        // The recreated REAL card and the badge tile are baked in — no BIOS
+        // needed — and the splash can hold on the card at once. The frame
+        // the ROM itself draws still replaces the card when it arrives.
+        app.pending_images
+            .push((LOGO_KEY.to_string(), boot_logo::render()));
+        app.pending_images
+            .push((WALL_KEY.to_string(), boot_logo::badge()));
+        if app.cfg.boot.is_none() && app.cfg.play.is_none() {
+            app.splash_until = Some(app.launched + Duration::from_millis(1800));
         }
         // The real boot logo, pulled out of the chosen BIOS by the core
         // itself, arrives on the artwork channel like any other picture.
@@ -1918,6 +1935,7 @@ impl GuiApp {
     fn view_machine(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, BG);
+        self.wallpaper(ui, area);
         let tiles = if self.fz1_tray_open { TILE_H + 18.0 } else { 0.0 };
         let scene = egui::Rect::from_min_max(
             area.min,
@@ -1927,6 +1945,45 @@ impl GuiApp {
         if self.fz1_tray_open {
             self.selector_strip(ui, area, tiles);
         }
+    }
+
+    /// The 3DO mark tiled faint across the machine view, drifting slowly —
+    /// a wall behind the console rather than a flat backdrop. Rows are
+    /// staggered brick-style so the pattern reads as a pattern, not a grid.
+    fn wallpaper(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        let Some(tex) = self.covers.get(WALL_KEY) else {
+            return;
+        };
+        let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
+        self.wall_drift += dt * 8.0;
+        let pitch_y = 190.0;
+        let badge_h = pitch_y;
+        let badge_w = pitch_y * tex.size_vec2().x / tex.size_vec2().y.max(1.0);
+        let pitch_x = badge_w * 2.1;
+        let uv =
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let tint = egui::Color32::from_white_alpha(18);
+        let painter = ui.painter();
+        let mut row = 0usize;
+        let mut y = area.min.y - pitch_y + self.wall_drift % pitch_y;
+        while y < area.max.y {
+            let mut x = area.min.x - pitch_x + pitch_x * 0.5 * (row % 2) as f32;
+            while x < area.max.x {
+                painter.image(
+                    tex.id(),
+                    egui::Rect::from_min_size(
+                        egui::pos2(x, y),
+                        egui::vec2(badge_w, badge_h),
+                    ),
+                    uv,
+                    tint,
+                );
+                x += pitch_x;
+            }
+            y += pitch_y;
+            row += 1;
+        }
+        ui.ctx().request_repaint();
     }
 
     /// The selector on its card along the bottom.
@@ -2100,9 +2157,6 @@ impl GuiApp {
                         }
                         if ui.button("⟲").on_hover_text("reset").clicked() {
                             self.emu.request_reset();
-                        }
-                        if ui.button("⏏").on_hover_text("eject").clicked() {
-                            self.eject_disc();
                         }
                         if ui.button("✕").on_hover_text("power off").clicked() {
                             self.power_off();

@@ -55,6 +55,28 @@ fn lit_fraction(console: &Console) -> usize {
         .count()
 }
 
+fn embedded(bytes: &[u8]) -> ColorImage {
+    let Ok(img) = image::load_from_memory(bytes) else {
+        return ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
+    };
+    let img = img.to_rgba8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    ColorImage::from_rgba_unmultiplied([w, h], img.as_raw())
+}
+
+/// The recreated boot card — the badge, the chrome R·E·A·L, the caption and
+/// the Panasonic line, drawn from docs/boot-logo-reference.png and baked in
+/// (docs/make-boot-logo.py). Always there, BIOS or not; the extracted frame
+/// replaces it when the ROM hands one over.
+pub fn render() -> ColorImage {
+    embedded(include_bytes!("../../../assets/boot-logo-real.png"))
+}
+
+/// The 3DO badge alone — the mark the machine view's wallpaper is tiled with.
+pub fn badge() -> ColorImage {
+    embedded(include_bytes!("../../../assets/3do-mark.png"))
+}
+
 /// Boot the BIOS in a headless console and keep the brightest frame in the
 /// splash window. Slow, so it runs on a worker thread and its result is
 /// cached; a `None` means the ROM would not boot, which is not fatal.
