@@ -157,21 +157,37 @@ fn ejecting_reports_an_empty_drive_and_spinning_up_reloads_it() {
     let mut drive = CdRomDevice::new();
     drive.set_disc_present(true);
 
-    let mut send = |op: u8| {
-        opcode(&mut drive, op);
+    fn send(drive: &mut CdRomDevice, op: u8) -> u8 {
+        opcode(drive, op);
         assert_eq!(drive.read_status(), op);
         drive.read_status()
-    };
+    }
 
     // Loaded: tray shut, disc in, spinning, ready.
-    assert_eq!(send(CMD_READ_STATUS), 0xe1);
+    assert_eq!(send(&mut drive, CMD_READ_STATUS), 0xe1);
+    assert!(!drive.tray_open());
 
-    // Ejected: ready and nothing else.
-    assert_eq!(send(CMD_EJECT), STATUS_READY);
-    assert_eq!(send(CMD_READ_STATUS), STATUS_READY);
+    // Ejected: ready and nothing else. The tray being out is the signal a
+    // front end watches for a game's disc request.
+    assert_eq!(send(&mut drive, CMD_EJECT), STATUS_READY);
+    assert!(drive.tray_open());
+    assert_eq!(send(&mut drive, CMD_READ_STATUS), STATUS_READY);
 
     // Spinning up closes the tray again — the other half of the handshake.
-    assert_eq!(send(CMD_MOTOR_ON), 0xe1);
+    assert_eq!(send(&mut drive, CMD_MOTOR_ON), 0xe1);
+    assert!(!drive.tray_open());
+}
+
+#[test]
+fn putting_a_disc_in_shuts_the_tray() {
+    let mut drive = CdRomDevice::new();
+    opcode(&mut drive, CMD_EJECT);
+    assert!(drive.tray_open());
+    drive.close_tray();
+    assert!(!drive.tray_open());
+    // With media in and the drawer shut the drive is loaded again.
+    drive.set_disc_present(true);
+    assert_eq!(drive.drive_status(), 0xe1);
 }
 
 #[test]

@@ -257,6 +257,18 @@ impl CdRomDevice {
         std::mem::take(&mut self.media_changed)
     }
 
+    /// Whether the tray is out. Software's EJECT is how a game asks for the
+    /// next disc, so a front end can watch this to swap at the right moment.
+    pub fn tray_open(&self) -> bool {
+        self.tray_open
+    }
+
+    /// Shut the tray after media has been put in it. Inserting closes the
+    /// drawer, the way a person does; the drive still waits to be spun up.
+    pub fn close_tray(&mut self) {
+        self.tray_open = false;
+    }
+
     pub fn disc_present(&self) -> bool {
         self.disc_present
     }

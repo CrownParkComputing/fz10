@@ -369,3 +369,45 @@ fn a_dma_request_smaller_than_the_buffered_sector_completes_immediately() {
     assert_eq!(byte(&mut console, 32), 0xa5);
     std::fs::remove_file(path).ok();
 }
+
+#[test]
+fn a_disc_swap_reports_the_change_without_resetting_the_machine() {
+    use retro3do::clio::reg;
+    use retro3do::memory::CLIO_BASE;
+    use retro3do::xbus::CMD_EJECT;
+    use streaming::*;
+
+    let one = image("swap-one.iso");
+    let two = image("swap-two.iso");
+    let mut console = Console::new();
+    console.reset();
+    assert!(console.load_disc(&one));
+    console.run_frame();
+    // Whatever the machine had done by now is what a swap must preserve.
+    let pc_before = console.cpu().reg(15);
+    let frame_before = console.frame_count();
+
+    // Software asks for the next disc: EJECT is the request a front end
+    // watches for.
+    for byte in [CMD_EJECT, 0, 0, 0, 0, 0, 0] {
+        console
+            .system_mut()
+            .write32(CLIO_BASE + reg::XBUS_COMMAND, u32::from(byte));
+    }
+    assert!(console.disc_tray_open());
+
+    // Insert the next disc in the set: the same eject and insert the tray UI
+    // already does, with no reset anywhere in it.
+    assert!(console.load_disc(&two));
+    assert!(!console.disc_tray_open(), "the drawer shuts on the new disc");
+    assert!(console.disc_loaded());
+    assert!(
+        console.disc().is_some_and(|d| d.path() == two),
+        "the drive holds disc two"
+    );
+    assert_eq!(console.cpu().reg(15), pc_before, "no reset: the CPU carries on");
+    assert_eq!(console.frame_count(), frame_before);
+
+    std::fs::remove_file(one).ok();
+    std::fs::remove_file(two).ok();
+}

@@ -228,9 +228,12 @@ impl Console {
             return self.fail(reason);
         }
         // Opening the image and telling the drive are different things; only
-        // the second is visible to software.
+        // the second is visible to software. Putting the disc in also shuts
+        // the drawer: swapping a disc is eject, insert, close, and the tray
+        // must not stay open over a disc that is already in it.
         drive.attach_disc(Some(disc));
         drive.set_disc_present(true);
+        drive.close_tray();
         self.last_error.clear();
         true
     }
@@ -239,6 +242,12 @@ impl Console {
         let drive = self.sys.clio.cdrom_mut();
         drive.attach_disc(None);
         drive.set_disc_present(false);
+    }
+
+    /// Whether software has the tray out (its EJECT), which is how a game
+    /// asks for the next disc of a multi-disc title.
+    pub fn disc_tray_open(&self) -> bool {
+        self.sys.clio.cdrom().tray_open()
     }
 
     pub fn disc_loaded(&self) -> bool {

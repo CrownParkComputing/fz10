@@ -406,6 +406,11 @@ impl Retro3do {
     pub fn disc_loaded(&self) -> bool {
         self.with_console(|c| c.disc_loaded())
     }
+    /// Whether the drive's tray is out — software's EJECT, which a game uses
+    /// to ask for the next disc. Front ends watch this to swap without reset.
+    pub fn disc_tray_open(&self) -> bool {
+        self.with_console(|c| c.disc_tray_open())
+    }
     pub fn disc_info(&self) -> Option<DiscInfo> {
         self.with_console(|c| {
             c.disc().filter(|disc| disc.is_open()).map(|disc| DiscInfo {

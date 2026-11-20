@@ -249,6 +249,13 @@ fn file_stem(p: &Path) -> String {
         .to_string()
 }
 
+/// A path's identity for "is this the same file?" questions: the resolved
+/// path when it exists, the text as written when it does not (an m3u may name
+/// a disc that has not been dumped yet).
+fn path_key(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 fn scan_dir(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Ok(read) = std::fs::read_dir(dir) {
@@ -290,8 +297,48 @@ fn scan_games(cfg: &Config) -> Vec<Game> {
         covers.extend(scan_dir(&cfg.media_dir.join(sub), &["png", "jpg", "jpeg"]));
     }
     let disc_art = scan_dir(&cfg.media_dir.join("cartridges"), &["png", "jpg", "jpeg"]);
+
+    // A title that spans discs is one entry. An `.m3u` beside them says so
+    // outright and fixes the order; without one, "Disc 2"/"CD2" and their
+    // like fold into the lowest-numbered disc.
+    let mut sets: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    let mut listed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for list in scan_dir(&cfg.games_dir, &["m3u"]) {
+        let Ok(text) = std::fs::read_to_string(&list) else {
+            continue;
+        };
+        let dir = list.parent().unwrap_or(&cfg.games_dir);
+        let discs: Vec<PathBuf> = text
+            .trim_start_matches('\u{feff}')
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let l = l.trim().trim_matches(|c| c == '"' || c == '\'');
+                let p = PathBuf::from(l);
+                let p = if p.is_absolute() {
+                    p
+                } else {
+                    dir.join(p)
+                };
+                // Resolve "./disc.iso" so the queue and the scan agree on
+                // identity; a name that does not exist yet is kept as typed.
+                path_key(&p)
+            })
+            .collect();
+        if !discs.is_empty() {
+            listed.extend(discs.iter().map(|p| path_key(p)));
+            sets.push((file_stem(&list), discs));
+        }
+    }
+
     let mut games = Vec::new();
     for path in scan_dir(&cfg.games_dir, &["chd", "iso", "cue", "bin", "img"]) {
+        // A disc an `.m3u` already names belongs to that title, not to its
+        // own carousel entry.
+        if listed.contains(&path_key(&path)) {
+            continue;
+        }
         let stem = normalize(&file_stem(&path));
         let cover = match_media(&stem, &covers);
         let disc = match_media(&stem, &disc_art);
@@ -305,36 +352,12 @@ fn scan_games(cfg: &Config) -> Vec<Game> {
             path,
         });
     }
+    fold_disc_sets(&mut games);
 
-    // A title that spans discs is one entry. An `.m3u` beside them says so
-    // outright; without one, "(Disc 2)" and its like fold into the first.
-    let mut sets: Vec<(String, Vec<PathBuf>)> = Vec::new();
-    for list in scan_dir(&cfg.games_dir, &["m3u"]) {
-        let Ok(text) = std::fs::read_to_string(&list) else {
-            continue;
-        };
-        let discs: Vec<PathBuf> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| {
-                let p = PathBuf::from(l);
-                if p.is_absolute() {
-                    p
-                } else {
-                    cfg.games_dir.join(p)
-                }
-            })
-            .collect();
-        if !discs.is_empty() {
-            sets.push((file_stem(&list), discs));
-        }
-    }
     for (title, discs) in sets {
         let Some(first) = discs.first().cloned() else {
             continue;
         };
-        games.retain(|g| !discs.contains(&g.path));
         let stem = normalize(&title);
         let cover = match_media(&stem, &covers);
         let label = match_media(&stem, &disc_art);
@@ -348,53 +371,93 @@ fn scan_games(cfg: &Config) -> Vec<Game> {
             path: first,
         });
     }
-    fold_disc_sets(&mut games);
     games.sort_by(|a, b| a.title.cmp(&b.title));
     games
 }
 
+/// The disc number in a filename stem, with the title it belongs to.
+///
+/// Recognises the shapes multi-disc sets actually ship as: "Disc 2", "(Disc
+/// 2 of 3)", "CD2", "CD 2", "Disk 2". The tag has to be a word of its own —
+/// "abcd2" is not a disc — and the digits follow it, so "Disc 2 (Rev 1)"
+/// reads as disc 2 rather than 21.
+fn disc_tag(title: &str) -> Option<(String, usize)> {
+    let lower = title.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for word in ["disc", "disk", "cd"] {
+        let mut from = 0;
+        while let Some(found) = lower[from..].find(word) {
+            let at = from + found;
+            let before_ok = at == 0 || !bytes.get(at - 1).is_some_and(u8::is_ascii_alphanumeric);
+            let after = at + word.len();
+            let after_ok = !bytes.get(after).is_some_and(u8::is_ascii_alphabetic);
+            if before_ok && after_ok {
+                let mut i = after;
+                while bytes
+                    .get(i)
+                    .is_some_and(|b| b.is_ascii_whitespace() || matches!(b, b'-' | b'_' | b'.' | b':'))
+                {
+                    i += 1;
+                }
+                let start = i;
+                while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                if i > start {
+                    // Two digits at most: a full number, not a year or a
+                    // revision baked into the same tag.
+                    if let Ok(number) = lower.get(start..i).unwrap_or_default().parse::<usize>() {
+                        if (1..=99).contains(&number) {
+                            let base = title
+                                .get(..at)
+                                .unwrap_or_default()
+                                .trim()
+                                .trim_end_matches(|c: char| {
+                                    c.is_whitespace() || "-_.:([{,".contains(c)
+                                })
+                                .trim()
+                                .to_string();
+                            if !base.is_empty() {
+                                return Some((base, number));
+                            }
+                        }
+                    }
+                }
+            }
+            from = at + word.len();
+        }
+    }
+    None
+}
+
 /// Fold "Title (Disc 2)" into "Title (Disc 1)" so a multi-disc game shows
-/// once. The other discs ride along for swapping mid-game.
+/// once. The discs ride along in number order for swapping mid-game, and the
+/// lowest number is the entry's boot disc.
 fn fold_disc_sets(games: &mut Vec<Game>) {
-    let base = |title: &str| -> Option<(String, usize)> {
-        let lower = title.to_ascii_lowercase();
-        let at = lower.find("(disc ").or_else(|| lower.find("(cd "))?;
-        let rest = lower.get(at..)?;
-        let number = rest
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse::<usize>()
-            .ok()?;
-        Some((title.get(..at)?.trim().to_string(), number))
-    };
     let mut folded: Vec<Game> = Vec::new();
-    let mut extra: Vec<(String, usize, PathBuf)> = Vec::new();
+    let mut groups: Vec<(String, Vec<(usize, Game)>)> = Vec::new();
     for game in games.drain(..) {
-        match base(&game.title) {
-            Some((stem, number)) if number > 1 => extra.push((stem, number, game.path)),
-            Some((stem, _)) => {
-                let mut first = game;
-                first.title = stem;
-                folded.push(first);
+        match disc_tag(&game.title) {
+            Some((stem, number)) => {
+                match groups
+                    .iter_mut()
+                    .find(|(s, _)| s.eq_ignore_ascii_case(&stem))
+                {
+                    Some((_, discs)) => discs.push((number, game)),
+                    None => groups.push((stem, vec![(number, game)])),
+                }
             }
             None => folded.push(game),
         }
     }
-    extra.sort_by_key(|(_, number, _)| *number);
-    for (stem, _, path) in extra {
-        match folded.iter_mut().find(|g| g.title == stem) {
-            Some(game) => game.discs.push(path),
-            None => folded.push(Game {
-                discs: vec![path.clone()],
-                title: stem,
-                cover: None,
-                cover_key: None,
-                disc_art: None,
-                disc_key: None,
-                path,
-            }),
+    for (stem, mut discs) in groups {
+        discs.sort_by_key(|(number, _)| *number);
+        let mut primary = discs.remove(0).1;
+        primary.title = stem;
+        for (_, extra) in discs {
+            primary.discs.extend(extra.discs);
         }
+        folded.push(primary);
     }
     *games = folded;
 }
@@ -654,6 +717,13 @@ struct GuiApp {
     fz1_user_zoom: f32,
     /// The disc in the machine, if any.
     game: Option<usize>,
+    /// Which disc of `game`'s set is in the drive. Swapping moves this within
+    /// the same title and leaves the machine running.
+    disc_index: usize,
+    /// When software last ejected the tray, so a game's "insert Disc 2" is
+    /// answered once the tray has actually stayed open rather than in the
+    /// middle of the driver's own mount-time eject.
+    guest_tray_since: Option<Instant>,
     scaler: Option<gpu_scale::GpuScaler>,
     frame_rgba: Vec<u8>,
     /// Last texture presented to the view: repaints outnumber published
@@ -770,6 +840,8 @@ impl GuiApp {
             drawer_zoom: 0.0,
             fz1_user_zoom: 0.65,
             game: None,
+            disc_index: 0,
+            guest_tray_since: None,
             scaler: None,
             frame_rgba: Vec::new(),
             last_frame: None,
@@ -864,6 +936,8 @@ impl GuiApp {
         match self.emu.load_disc(path.to_string_lossy().as_ref()) {
             Ok(()) => {
                 self.game = Some(index);
+                self.disc_index = 0;
+                self.guest_tray_since = None;
                 self.status = format!("{title} inserted");
                 self.view = View::Machine;
                 self.fz1_tray_open = false;
@@ -884,6 +958,73 @@ impl GuiApp {
         }
     }
 
+    /// The discs of the title in the machine, in queue order.
+    fn disc_queue(&self) -> &[PathBuf] {
+        match self.game.and_then(|g| self.games.get(g)) {
+            Some(game) => &game.discs,
+            None => &[],
+        }
+    }
+
+    /// Put disc `index` of the current title in the drive. This is a tray
+    /// swap, not a boot: the machine keeps running, with its RAM, its
+    /// progress and the game's own "insert Disc 2" prompt intact.
+    fn swap_disc(&mut self, index: usize) {
+        let Some(path) = self.disc_queue().get(index).cloned() else {
+            return;
+        };
+        if self.game.is_none() || index == self.disc_index {
+            return;
+        }
+        let title = self
+            .game
+            .and_then(|g| self.games.get(g))
+            .map(|g| g.title.clone())
+            .unwrap_or_default();
+        let total = self.disc_queue().len();
+        self.save_nvram();
+        // The core's insert is eject-and-insert without a reset; the machine
+        // is never stopped here, so nothing it holds is lost.
+        match self.emu.load_disc(path.to_string_lossy().as_ref()) {
+            Ok(()) => {
+                self.disc_index = index;
+                self.guest_tray_since = None;
+                self.status = format!("{title} — disc {} of {total} in the drive", index + 1);
+            }
+            Err(e) => {
+                self.status = format!("disc {}: {e}", index + 1);
+            }
+        }
+    }
+
+    /// The next disc in the queue, for the guest's own disc request and the
+    /// next-disc control.
+    fn swap_next_disc(&mut self) {
+        let next = self.disc_index + 1;
+        if next < self.disc_queue().len() {
+            self.swap_disc(next);
+        }
+    }
+
+    /// Watch the drive's tray. Software ejects it to ask for the next disc;
+    /// a game that is merely mounting ejects and spins up again at once, so
+    /// only a tray left open is taken as the request.
+    fn poll_disc_request(&mut self) {
+        if !self.emu.running() || self.game.is_none() || self.fz1_tray_open {
+            self.guest_tray_since = None;
+            return;
+        }
+        if self.emu.disc_tray_open() {
+            let since = *self.guest_tray_since.get_or_insert_with(Instant::now);
+            let more = self.disc_index + 1 < self.disc_queue().len();
+            if since.elapsed() > Duration::from_millis(1500) && more {
+                self.swap_next_disc();
+            }
+        } else {
+            self.guest_tray_since = None;
+        }
+    }
+
     /// Take the disc out. The machine keeps running and falls back to the
     /// BIOS, which is what the console does with an empty tray.
     fn eject_disc(&mut self) {
@@ -894,6 +1035,8 @@ impl GuiApp {
         }
         self.emu.eject_disc();
         self.game = None;
+        self.disc_index = 0;
+        self.guest_tray_since = None;
         self.fz1_tray_open = true;
         self.pending_start = None;
         self.picture_live = false;
@@ -1825,6 +1968,8 @@ impl eframe::App for GuiApp {
             self.disc_angle += dt * if running { 9.0 } else { 0.6 };
             ctx.request_repaint();
         }
+        // A game asking for the next disc ejects the tray; answer it.
+        self.poll_disc_request();
 
         // Audio and saves only matter while the machine runs.
         if running {
@@ -2236,6 +2381,7 @@ impl GuiApp {
             );
         }
         if !self.fz1_tray_open {
+            self.disc_swap_strip(ui, rect);
             self.eject_corner(ui, rect);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -2277,6 +2423,44 @@ impl GuiApp {
 
     /// One pad in a view of its own. Clicking it picks it up: that is the
     /// pad the keyboard then works.
+    /// The other discs of the title in the machine, always in reach while it
+    /// plays: one button per remaining disc, and the current one named. This
+    /// is the manual half of the swap; the guest's own EJECT is the automatic
+    /// half. Neither resets the machine.
+    fn disc_swap_strip(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let total = self.disc_queue().len();
+        if total < 2 {
+            return;
+        }
+        let current = self.disc_index;
+        let area = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 12.0, rect.max.y - 44.0),
+            egui::vec2(rect.width() - 90.0, 32.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("disc {} of {total}", current + 1))
+                        .small()
+                        .color(TEXT_DIM),
+                );
+                for index in 0..total {
+                    if index == current {
+                        continue;
+                    }
+                    let label = format!("⏏ Disc {}", index + 1);
+                    if ui
+                        .small_button(label)
+                        .on_hover_text("swap this disc in — the game keeps running")
+                        .clicked()
+                    {
+                        self.swap_disc(index);
+                    }
+                }
+            });
+        });
+    }
+
     /// The eject corner: the way back to choosing a game from the picture.
     fn eject_corner(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let size = 34.0;
@@ -2349,4 +2533,174 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, cfg)))),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::*;
+
+    fn game(title: &str, disc: &str) -> Game {
+        let path = PathBuf::from(disc);
+        Game {
+            discs: vec![path.clone()],
+            title: title.to_string(),
+            cover: None,
+            cover_key: None,
+            disc_art: None,
+            disc_key: None,
+            path,
+        }
+    }
+
+    #[test]
+    fn disc_tag_reads_the_shapes_sets_ship_as() {
+        let cases = [
+            ("Game (Disc 2)", "Game", 2),
+            ("Game (Disc 2 of 3)", "Game", 2),
+            ("Game [Disc 3]", "Game", 3),
+            ("Game Disc 2", "Game", 2),
+            ("Game CD2", "Game", 2),
+            ("Game CD 2", "Game", 2),
+            ("Game - Disk 4", "Game", 4),
+            ("Game (CD 1) (USA)", "Game", 1),
+            ("Game (Disc 10)", "Game", 10),
+        ];
+        for (title, stem, number) in cases {
+            assert_eq!(disc_tag(title), Some((stem.to_string(), number)), "{title}");
+        }
+    }
+
+    #[test]
+    fn disc_tag_ignores_words_that_only_contain_disc() {
+        for title in [
+            "Abcd2",
+            "Disco Elysium",
+            "CD-i Adventure",
+            "Game (Disc)",
+            "Game (Disc 0)",
+            "2CD Collection",
+        ] {
+            assert_eq!(disc_tag(title), None, "{title}");
+        }
+    }
+
+    #[test]
+    fn fold_keeps_one_entry_per_title_in_disc_order() {
+        let mut games = vec![
+            game("Game (Disc 2)", "b/d2.chd"),
+            game("Game (Disc 1)", "b/d1.chd"),
+            game("Other", "b/other.chd"),
+            game("Game (Disc 3 of 3)", "b/d3.chd"),
+        ];
+        fold_disc_sets(&mut games);
+        games.sort_by(|a, b| a.title.cmp(&b.title));
+        assert_eq!(games.len(), 2);
+        assert_eq!(games[0].title, "Game");
+        assert_eq!(
+            games[0].discs,
+            vec![
+                PathBuf::from("b/d1.chd"),
+                PathBuf::from("b/d2.chd"),
+                PathBuf::from("b/d3.chd")
+            ]
+        );
+        // The lowest-numbered disc is what the entry boots.
+        assert_eq!(games[0].path, PathBuf::from("b/d1.chd"));
+        assert_eq!(games[1].title, "Other");
+    }
+
+    #[test]
+    fn fold_of_a_set_with_no_first_disc_still_offers_its_discs() {
+        let mut games = vec![game("Game (Disc 2)", "b/d2.chd"), game("Game (Disc 3)", "b/d3.chd")];
+        fold_disc_sets(&mut games);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].discs.len(), 2);
+        assert_eq!(games[0].path, PathBuf::from("b/d2.chd"));
+    }
+    #[test]
+    fn scanning_a_synthetic_multidisc_layout_makes_one_entry_per_title() {
+        let root = std::env::temp_dir().join(format!(
+            "retro3do-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let games_dir = root.join("games");
+        let media_dir = root.join("media");
+        std::fs::create_dir_all(&games_dir).unwrap();
+        std::fs::create_dir_all(&media_dir).unwrap();
+        for name in [
+            "Solo Game (USA).iso",
+            "Saga (Disc 2).chd",
+            "Saga (Disc 1).chd",
+            "Saga (Disc 3).chd",
+            "Tale CD1.iso",
+            "Tale CD2.iso",
+        ] {
+            std::fs::write(games_dir.join(name), b"x").unwrap();
+        }
+        // An m3u names its own order, and the images it names must not also
+        // appear as separate carousel entries — even when the list writes
+        // "./" in front of them.
+        std::fs::write(games_dir.join("Playlist Disc A.iso"), b"x").unwrap();
+        std::fs::write(games_dir.join("Playlist Disc B.iso"), b"x").unwrap();
+        std::fs::write(
+            games_dir.join("Playlist.m3u"),
+            "#EXTM3U\r\n./Playlist Disc A.iso\r\n\"Playlist Disc B.iso\"\r\n",
+        )
+        .unwrap();
+
+        let cfg = Config {
+            games_dir: games_dir.clone(),
+            media_dir,
+            bios_dir: root.join("bios"),
+            saves_dir: root.join("saves"),
+            boot: None,
+            play: None,
+            docs_dir: root.join("docs"),
+            bios_choice: None,
+            configured: true,
+            texdir: None,
+        };
+        let games = scan_games(&cfg);
+        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Playlist", "Saga", "Solo Game (USA)", "Tale"],
+            "one entry per title, sorted; no disc leaked out on its own"
+        );
+        let saga = games.iter().find(|g| g.title == "Saga").unwrap();
+        assert_eq!(
+            saga.discs,
+            vec![
+                games_dir.join("Saga (Disc 1).chd"),
+                games_dir.join("Saga (Disc 2).chd"),
+                games_dir.join("Saga (Disc 3).chd")
+            ]
+        );
+        assert_eq!(saga.path, games_dir.join("Saga (Disc 1).chd"));
+        let tale = games.iter().find(|g| g.title == "Tale").unwrap();
+        assert_eq!(
+            tale.discs,
+            vec![games_dir.join("Tale CD1.iso"), games_dir.join("Tale CD2.iso")]
+        );
+        let playlist = games.iter().find(|g| g.title == "Playlist").unwrap();
+        assert_eq!(
+            playlist.discs,
+            vec![
+                games_dir.join("Playlist Disc A.iso"),
+                games_dir.join("Playlist Disc B.iso")
+            ],
+            "m3u order is the queue order"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
