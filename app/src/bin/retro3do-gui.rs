@@ -46,6 +46,11 @@ const SHELF_MAX_SPINES: usize = 20;
 /// How long the unboxing and the box-away run, in seconds.
 const UNBOX_SECS: f32 = 9.0;
 const BOXAWAY_SECS: f32 = 5.0;
+/// How long the machine stands alone on the table after the unboxing before
+/// the shelf comes in, and how long the shelf takes to arrive. Nothing is
+/// allowed over the reveal until the machine has settled.
+const SHELF_WAIT: f32 = 0.45;
+const SHELF_FADE: f32 = 0.8;
 /// The presentation spin: the sealed carton turns once on the spot, slowly,
 /// before the lid opens, so every face of the retail box is seen.
 const SPIN_SECS: f32 = 6.0;
@@ -1169,6 +1174,10 @@ struct GuiApp {
     backs: Vec<Option<PathBuf>>,
     /// How far the shelf has scrolled when it is wider than the window.
     shelf_scroll: f32,
+    /// Seconds the machine has stood settled on the table. The shelf is held
+    /// back until the unboxing has played out, so nothing is drawn over the
+    /// reveal; see `SHELF_WAIT` and `SHELF_FADE`.
+    settled_for: f32,
     /// The case being looked at in the upper view, and the game whose
     /// artwork is in the case model's slots.
     case_open: Option<usize>,
@@ -1434,6 +1443,7 @@ impl GuiApp {
             spines: Vec::new(),
             backs: Vec::new(),
             shelf_scroll: 0.0,
+            settled_for: 0.0,
             case_open: None,
             case_art_for: None,
             slot_tx,
@@ -2527,6 +2537,14 @@ impl GuiApp {
                 self.spun = s >= 1.0;
             }
         }
+        // The shelf only exists once the machine is out, standing still and
+        // on its feet: while the carton turns, opens and gives the machine
+        // up, the show has the window to itself.
+        self.settled_for = if self.closing.is_none() && self.fz1_state.unbox >= 0.999 {
+            self.settled_for + dt
+        } else {
+            0.0
+        };
         self.fz1_state.zoom = self.fz1_user_zoom.clamp(0.45, 3.0);
     }
 
@@ -3234,7 +3252,7 @@ impl GuiApp {
         // goes as it is packed away.
         let alpha = match self.closing {
             Some(c) => 1.0 - (c * 4.0).min(1.0),
-            None => ((self.fz1_state.unbox - 0.8) / 0.2).clamp(0.0, 1.0),
+            None => ((self.settled_for - SHELF_WAIT) / SHELF_FADE).clamp(0.0, 1.0),
         };
         // While the carton is still turning and the machine is coming out of
         // it, there is no shelf, so the show gets the whole window: the scene
