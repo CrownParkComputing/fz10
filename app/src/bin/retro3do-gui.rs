@@ -39,9 +39,11 @@ use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 const TILE_W: f32 = 190.0;
 const TILE_H: f32 = 108.0;
 
-/// Audio the stream keeps buffered, and how much is pulled at a time.
+/// Audio the stream keeps buffered — about 93 ms at 44.1 kHz, deep enough to
+/// play through a stalled emulated field without a gap, thin enough that the
+/// picture and the sound stay married — and how much is pulled at a time.
 #[cfg(not(target_os = "android"))]
-const AUDIO_PAIRS_TARGET: i32 = 2048;
+const AUDIO_PAIRS_TARGET: i32 = 4096;
 const AUDIO_PAIRS_PULL: usize = 1024;
 #[cfg(not(target_os = "android"))]
 const AUDIO_BYTES_PER_PAIR: i32 = 4;

@@ -18,13 +18,19 @@
 //! disc rather than a misread one. So the layout is always detected from the
 //! sync pattern, never assumed from the name.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::chd::{
     probe_chd, ChdFile, ChdInfo, CDROM_TRACK_METADATA2_TAG, CDROM_TRACK_METADATA_TAG,
     CD_MAX_SECTOR_DATA, CD_TRACK_PADDING,
 };
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// A CD sector's user area is always this, whatever the container.
 pub const SECTOR_USER_BYTES: u32 = 2048;
@@ -95,14 +101,18 @@ pub struct Track {
     pub length_sectors: u32,
 }
 
-/// A CHD being read as a disc: the file, the geometry that turns a logical
-/// block into a place inside a hunk, and one hunk of cache.
+/// A CHD being read as a disc: the geometry that turns a logical block into
+/// a place inside a hunk, and the decoded hunks a worker keeps ahead.
 ///
-/// The cache matters more than it looks. A CD hunk is eight frames, and
-/// decompressing one costs an LZMA or FLAC decode; reading sector by sector
-/// without it would decode the same hunk eight times over.
+/// A CD hunk is eight frames, and decompressing one costs an LZMA or FLAC
+/// decode — several milliseconds, occasionally far more on a slow disk.
+/// Done on the emulation thread inside `read_sector` that cost lands
+/// mid-field and judders the frame the sound and picture are waiting on, so
+/// the file lives on a worker thread that decodes a window ahead of the
+/// reader instead.
 struct ChdReader {
-    file: ChdFile<File>,
+    prefetch: Arc<ChdPrefetch>,
+    worker: Option<std::thread::JoinHandle<()>>,
     unit_bytes: u32,
     frames_per_hunk: u32,
     /// Where the first data track's frames begin inside the CHD. Tracks are
@@ -116,33 +126,115 @@ struct ChdReader {
     /// yield sync bytes where the filesystem should be. Most 3DO dumps in
     /// circulation are MODE1_RAW.
     payload_offset: u32,
-    hunk: Vec<u8>,
-    cached_hunk: Option<u32>,
+    /// The hunk the last frame came from: a hit repeats eight times.
+    current: Option<(u32, Arc<Vec<u8>>)>,
+}
+
+/// How far past the reader's position the worker decodes, in hunks. Eight
+/// hunks is sixty-four sectors — over a second of double-speed streaming —
+/// while the drive's sector pacing gives the worker far longer than a decode
+/// takes to stay ahead.
+const PREFETCH_HUNKS: u32 = 8;
+
+/// The worker's side of the reader: decoded hunks waiting to be consumed.
+struct ChdPrefetch {
+    state: Mutex<PrefetchState>,
+    ready: Condvar,
+}
+
+struct PrefetchState {
+    /// The hunk the reader most recently asked for; the window starts here.
+    want: u32,
+    /// Hunk -> decoded bytes. `None` marks a read that failed, so the reader
+    /// learns it instead of waiting for a hunk that will never land.
+    hunks: BTreeMap<u32, Option<Arc<Vec<u8>>>>,
+    stop: bool,
+}
+
+/// Decodes hunks ahead of the reader until told to stop. Owns the file:
+/// every CHD read — including the reader's own misses — happens here.
+fn prefetch_loop(file: &mut ChdFile<File>, hunk_bytes: usize, shared: &ChdPrefetch) {
+    loop {
+        let target = {
+            let mut state = lock(&shared.state);
+            loop {
+                if state.stop {
+                    return;
+                }
+                // The lowest undecoded hunk in the window ahead of the reader.
+                let end = state.want.saturating_add(PREFETCH_HUNKS);
+                match (state.want..end).find(|h| !state.hunks.contains_key(h)) {
+                    Some(hunk) => break hunk,
+                    None => state = shared.ready.wait(state).unwrap_or_else(PoisonError::into_inner),
+                }
+            }
+        };
+        let mut hunk = vec![0u8; hunk_bytes];
+        let decoded = file.read_hunk(target, &mut hunk).ok().map(|_| Arc::new(hunk));
+        let mut state = lock(&shared.state);
+        state.hunks.insert(target, decoded);
+        // Nothing below the reader's position is coming back into use.
+        let want = state.want;
+        state.hunks.retain(|hunk, _| *hunk >= want);
+        shared.ready.notify_all();
+    }
 }
 
 impl ChdReader {
+    /// The decoded hunk `index`, waiting on the worker if it has to. `None`
+    /// when the read failed or the worker is gone.
+    fn hunk(&mut self, index: u32) -> Option<Arc<Vec<u8>>> {
+        let mut state = lock(&self.prefetch.state);
+        state.want = index;
+        self.prefetch.ready.notify_one();
+        loop {
+            if let Some(decoded) = state.hunks.get(&index) {
+                return decoded.clone();
+            }
+            // Stopped, or the worker died holding the other reference: a hunk
+            // that will never land is a failed read, not a hang.
+            if state.stop || Arc::strong_count(&self.prefetch) < 2 {
+                return None;
+            }
+            state = self
+                .prefetch
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
     /// Copies 2352 bytes of a stored frame, starting at the payload, into
     /// `out`.
     fn read_frame(&mut self, frame: u32, out: &mut [u8]) -> bool {
-        let hunk = frame / self.frames_per_hunk;
+        let index = frame / self.frames_per_hunk;
         let within = (frame % self.frames_per_hunk) as usize * self.unit_bytes as usize;
-        if self.cached_hunk != Some(hunk) {
-            // A failed read leaves the buffer half-written, so it no longer
-            // holds the old hunk either.
-            self.cached_hunk = None;
-            if self.file.read_hunk(hunk, &mut self.hunk).is_err() {
-                return false;
-            }
-            self.cached_hunk = Some(hunk);
+        if self.current.as_ref().map(|(hunk, _)| *hunk) != Some(index) {
+            self.current = self.hunk(index).map(|decoded| (index, decoded));
         }
+        let Some((_, hunk)) = &self.current else {
+            return false;
+        };
         let start = within + self.payload_offset as usize;
         let length = CD_MAX_SECTOR_DATA as usize;
-        match (self.hunk.get(start..start + length), out.get_mut(..length)) {
+        match (hunk.get(start..start + length), out.get_mut(..length)) {
             (Some(src), Some(dst)) => {
                 dst.copy_from_slice(src);
                 true
             }
             _ => false,
+        }
+    }
+}
+
+impl Drop for ChdReader {
+    fn drop(&mut self) {
+        lock(&self.prefetch.state).stop = true;
+        self.prefetch.ready.notify_one();
+        // At most one in-flight decode: quick, and it frees the file on the
+        // way out rather than some later moment nobody can see.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -506,7 +598,7 @@ impl Disc {
 
     /// Opens a CHD and works out where the data track lives inside it.
     fn open_chd(&mut self, file: File, display_name: &str) -> bool {
-        let chd = match ChdFile::open(file) {
+        let mut chd = match ChdFile::open(file) {
             Ok(chd) => chd,
             Err(error) => {
                 self.last_error = format!("{display_name}: {error}");
@@ -520,22 +612,27 @@ impl Disc {
             self.last_error = format!("{display_name}: unexpected CHD geometry");
             return false;
         }
-        let mut hunk = Vec::new();
         let hunk_len = usize::try_from(hunk_bytes).unwrap_or(usize::MAX);
-        if hunk.try_reserve_exact(hunk_len).is_err() {
+        if Vec::<u8>::new().try_reserve_exact(hunk_len).is_err() {
             self.last_error = format!("{display_name}: out of memory");
             return false;
         }
-        hunk.resize(hunk_len, 0);
 
         let mut reader = ChdReader {
-            file: chd,
+            prefetch: Arc::new(ChdPrefetch {
+                state: Mutex::new(PrefetchState {
+                    want: 0,
+                    hunks: BTreeMap::new(),
+                    stop: false,
+                }),
+                ready: Condvar::new(),
+            }),
+            worker: None,
             unit_bytes,
             frames_per_hunk: hunk_bytes / unit_bytes,
             data_track_frame: 0,
             payload_offset: 0,
-            hunk,
-            cached_hunk: None,
+            current: None,
         };
 
         // Walk the track metadata. Tracks sit one after another in the CHD,
@@ -549,11 +646,9 @@ impl Disc {
                 let end = data.iter().position(|b| *b == 0).unwrap_or(data.len());
                 String::from_utf8_lossy(data.get(..end).unwrap_or(&[])).into_owned()
             };
-            let parsed = if let Ok(data) =
-                reader.file.metadata(CDROM_TRACK_METADATA2_TAG, index, 512)
-            {
+            let parsed = if let Ok(data) = chd.metadata(CDROM_TRACK_METADATA2_TAG, index, 512) {
                 parse_track(&text(data), TRACK_METADATA2_FORMAT, 8)
-            } else if let Ok(data) = reader.file.metadata(CDROM_TRACK_METADATA_TAG, index, 512) {
+            } else if let Ok(data) = chd.metadata(CDROM_TRACK_METADATA_TAG, index, 512) {
                 parse_track(&text(data), TRACK_METADATA_FORMAT, 4)
             } else {
                 None
@@ -590,6 +685,12 @@ impl Disc {
             self.last_error = format!("{display_name}: no data track");
             return false;
         }
+
+        let prefetch = Arc::clone(&reader.prefetch);
+        let mut file = chd;
+        reader.worker = Some(std::thread::spawn(move || {
+            prefetch_loop(&mut file, hunk_len, &prefetch);
+        }));
 
         self.layout = SectorLayout::Cooked2048;
         self.source = Source::Chd(Box::new(reader));
