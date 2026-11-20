@@ -807,11 +807,23 @@ impl Vdlp {
         match found {
             Some((surface, line)) => {
                 let skip = (line.x * k) as usize;
+                // The surface is the framebuffer's own picture with the
+                // field's cels drawn over it, so where the display list
+                // drew nothing it still holds the previous field's pixels.
+                // The logical row says what was actually drawn: black there
+                // means nothing was, and the mirror must not show through —
+                // that is what leaves a trail behind a moving element.
+                let native = self.field.row(output_line);
                 // Runs of one value are common; shade each value once.
                 let mut last: Option<(u16, u32)> = None;
                 for (sub, row) in (0u32..).zip(rows.chunks_mut(row_width)) {
                     let from = surface.row(line.y * k + sub).iter().skip(skip);
-                    for (pixel, &value) in row.iter_mut().zip(from) {
+                    for (index, (pixel, &value)) in row.iter_mut().zip(from).enumerate() {
+                        let native_x = line.x + (index as u32) / k;
+                        if native.get(native_x as usize) == Some(&OPAQUE_BLACK) {
+                            *pixel = OPAQUE_BLACK;
+                            continue;
+                        }
                         *pixel = match last {
                             Some((seen, shaded)) if seen == value => shaded,
                             _ => {
