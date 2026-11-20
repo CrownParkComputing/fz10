@@ -1196,13 +1196,14 @@ impl GuiApp {
             self.emu.set_region(Region::Pal);
         }
         let was_running = self.emu.running();
-        self.emu.start();
         if !was_running {
             // A machine coming up cold starts at the reset vector. A machine
             // that was stopped resumes where it left off, and the BIOS would
-            // never re-run to pick the disc in the drive up.
+            // never re-run to pick the disc in the drive up. Asked for before
+            // the thread starts, so the reset lands before the first field.
             self.emu.request_reset();
         }
+        self.emu.start();
         self.picture_live = false;
         self.fz1_tray_open = false;
         self.status.clear();
