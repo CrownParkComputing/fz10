@@ -31,6 +31,12 @@ struct Options {
     bios: Option<String>,
     disc: Option<String>,
     frames: Option<u32>,
+    /// Internal render scale, as the launcher asks for it: above one the
+    /// fields come from the hi-res surfaces instead of the cel expansion.
+    scale: Option<u32>,
+    /// The launcher's built-in art enhancement, which also turns on the
+    /// surface path.
+    enhance: bool,
 }
 
 fn parse() -> Result<Options, String> {
@@ -48,6 +54,14 @@ fn parse() -> Result<Options, String> {
                     value()?
                         .parse()
                         .map_err(|_| "--frames needs a number".to_owned())?,
+                )
+            }
+            "--enhance" => options.enhance = true,
+            "--scale" => {
+                options.scale = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "--scale needs a number".to_owned())?,
                 )
             }
             "--help" | "-h" => return Err(String::new()),
@@ -72,6 +86,12 @@ fn boot(options: &Options) -> Result<Console, String> {
         }
     }
     console.reset();
+    if let Some(scale) = options.scale {
+        console.set_internal_scale(scale);
+    }
+    if options.enhance {
+        console.set_texture_enhance(true);
+    }
     Ok(console)
 }
 
