@@ -633,7 +633,9 @@ impl SoundAndPads {
     /// Looks for pads plugged in or pulled out since the last look.
     fn refresh(&mut self) {
         if let Some(g) = self.gamepads.as_mut() {
-            g.refresh();
+            if g.refresh() {
+                eprintln!("[pad] connected: {:?}", g.names());
+            }
         }
     }
 }
@@ -824,8 +826,19 @@ struct GuiApp {
     last_frame: Option<(egui::TextureId, egui::Vec2)>,
     audio_buf: Vec<i16>,
     disc_angle: f32,
+    /// How fast the platter is turning, in radians a second. The spindle
+    /// cuts power to stop it, so the disc coasts down instead of stopping
+    /// dead.
+    disc_speed: f32,
     status: String,
     last_nvram_save: Instant,
+}
+
+/// Which title the platter wears: the disc that is in the drive, never the
+/// one merely highlighted in the shelf. A disc that has just been ejected
+/// stays on the platter while the spindle coasts down.
+fn platter_title(game: Option<usize>, disc_loaded: bool, spinning: bool) -> Option<usize> {
+    game.filter(|_| disc_loaded || spinning)
 }
 
 impl GuiApp {
@@ -945,6 +958,7 @@ impl GuiApp {
             last_frame: None,
             audio_buf: vec![0; AUDIO_PAIRS_PULL * 2],
             disc_angle: 0.0,
+            disc_speed: 0.0,
             status: String::new(),
             last_nvram_save: Instant::now(),
             cfg,
@@ -1132,7 +1146,9 @@ impl GuiApp {
             self.emu.stop();
         }
         self.emu.eject_disc();
-        self.game = None;
+        // The disc is out of the drive but still on the platter: it coasts
+        // down like real hardware does. The launcher forgets the disc once
+        // the spindle has stopped.
         self.disc_index = 0;
         self.guest_tray_since = None;
         self.fz1_tray_open = true;
@@ -1143,6 +1159,16 @@ impl GuiApp {
         if running {
             self.emu.start();
             self.emu.request_reset();
+        }
+    }
+
+    /// The drive can empty without the launcher doing it: the BIOS ejects
+    /// the disc, or a guest asks for the next one of a set. What the machine
+    /// shows has to follow the drive, not the last thing the launcher did,
+    /// so it never claims a disc that is not in it.
+    fn sync_disc_state(&mut self) {
+        if self.game.is_some() && !self.emu.disc_loaded() {
+            self.status = "disc out — the BIOS is waiting".to_string();
         }
     }
 
@@ -1169,7 +1195,14 @@ impl GuiApp {
         if self.pal {
             self.emu.set_region(Region::Pal);
         }
+        let was_running = self.emu.running();
         self.emu.start();
+        if !was_running {
+            // A machine coming up cold starts at the reset vector. A machine
+            // that was stopped resumes where it left off, and the BIOS would
+            // never re-run to pick the disc in the drive up.
+            self.emu.request_reset();
+        }
         self.picture_live = false;
         self.fz1_tray_open = false;
         self.status.clear();
@@ -1797,17 +1830,13 @@ impl GuiApp {
     }
 
     fn toggle_tray(&mut self) {
-        eprintln!("[DEBUG] toggle_tray: current open={}", self.fz1_tray_open);
         self.fz1_tray_open = !self.fz1_tray_open;
-        eprintln!("[DEBUG] toggle_tray: new open={}", self.fz1_tray_open);
         if !self.fz1_tray_open {
+            // Shutting the drawer on a chosen disc loads it.
             self.pending_start = self.selected_game();
-            eprintln!("[DEBUG] toggle_tray: pending_start set to {:?}", self.pending_start);
-        } else {
-            // When opening the tray, stop disc spin
-            self.disc_angle = 0.0;
-            eprintln!("[DEBUG] toggle_tray: disc_angle reset due to open tray");
         }
+        // Opening the drawer cuts the spindle: the disc coasts down and
+        // stays stopped while the drawer is out.
     }
 
     /// Drive the start the drawer is holding up, once it has closed.
@@ -1858,7 +1887,16 @@ impl GuiApp {
         let art = match self.view {
             View::Setup => None,
             View::Machine => {
-                let game = self.selected_game().and_then(|g| self.games.get(g));
+                // The platter wears the disc that is actually in the drive.
+                // The shelf's selection is a choice, not an insertion: on a
+                // fresh launch nothing is in the machine, so the platter is
+                // bare even with a title highlighted.
+                let game = platter_title(
+                    self.game,
+                    self.emu.disc_loaded(),
+                    self.disc_speed > 0.01,
+                )
+                .and_then(|g| self.games.get(g));
                 game.and_then(|g| self.disc_label(g))
                     .or_else(|| game.and_then(|g| g.cover.clone()))
             }
@@ -2072,15 +2110,43 @@ impl eframe::App for GuiApp {
         self.poll_frame();
 
         // Disc spin: full speed while the machine runs, a slow show-off turn
-        // while a disc just sits in the tray.
+        // while a disc just sits in the tray. The spindle cuts power on
+        // eject, so the disc coasts down instead of stopping dead. The
+        // console is not drawn while the picture is up, so the spin is
+        // frozen there — paused, not torn down.
         let running = self.emu.running();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        if self.emu.disc_loaded() && !self.fz1_tray_open { // spin only when tray closed
-            self.disc_angle += dt * if running { 9.0 } else { 0.6 };
-            ctx.request_repaint();
+        if self.console_fade > 0.001 {
+            let target = if !self.emu.disc_loaded() || self.fz1_tray_open {
+                0.0
+            } else if running {
+                9.0
+            } else {
+                0.6
+            };
+            // Power off is quick; a real drive takes its time to come up.
+            let rate = if target < self.disc_speed { 12.0 } else { 4.0 };
+            self.disc_speed += (target - self.disc_speed).clamp(-dt * rate, dt * rate);
+            self.disc_angle += dt * self.disc_speed;
+            if self.disc_speed > 0.01 {
+                ctx.request_repaint();
+            }
+            // Spindle stopped and nothing in the drive: the disc is off the
+            // platter. A guest asking for the next disc of a set keeps the
+            // title, so the swap still knows what to put in.
+            if self.game.is_some()
+                && self.disc_speed <= 0.01
+                && !self.emu.disc_loaded()
+                && !self.emu.disc_tray_open()
+            {
+                self.game = None;
+            }
         }
         // A game asking for the next disc ejects the tray; answer it.
         self.poll_disc_request();
+        // The drive can empty behind the launcher's back; what the machine
+        // shows has to follow the drive, not the last thing the launcher did.
+        self.sync_disc_state();
 
         // Audio and saves only matter while the machine runs.
         if running {
@@ -2849,5 +2915,17 @@ mod tests {
             "m3u order is the queue order"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_platter_shows_the_disc_in_the_drive() {
+        // A title highlighted in the shelf is a choice, not an insertion:
+        // with nothing in the drive the platter is bare.
+        assert_eq!(platter_title(Some(3), false, false), None);
+        assert_eq!(platter_title(Some(3), true, false), Some(3));
+        // Ejected, but the spindle has not stopped yet: the disc is still
+        // coasting down on the platter.
+        assert_eq!(platter_title(Some(3), false, true), Some(3));
+        assert_eq!(platter_title(None, true, true), None);
     }
 }
