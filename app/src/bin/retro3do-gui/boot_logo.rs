@@ -69,7 +69,7 @@ fn embedded(bytes: &[u8]) -> ColorImage {
 /// (docs/make-boot-logo.py). Always there, BIOS or not; the extracted frame
 /// replaces it when the ROM hands one over.
 pub fn render() -> ColorImage {
-    embedded(include_bytes!("../../../assets/boot-logo-real.png"))
+    embedded(include_bytes!("../../../../docs/3do-logo-hires.png"))
 }
 
 /// The 3DO badge alone — the mark the machine view's wallpaper is tiled with.

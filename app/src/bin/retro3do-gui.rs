@@ -607,6 +607,16 @@ struct GuiApp {
     art_zoom: bool,
     /// Whether the machine and the pads turn on their own.
     console_spin: bool,
+    /// The slow turn the machine makes on launch, before anyone has taken
+    /// hold of it. The first drag ends it for good; the ⟳ control's spin is
+    /// a separate, asked-for thing.
+    auto_spin: bool,
+    /// Opacity of the "drag to rotate" hint: 1 while it is new, draining to
+    /// 0 once it has had its moment or been acted on. `orbit_seen` counts the
+    /// seconds the machine has been on screen as a control, so the hint's
+    /// moment is measured by when it could actually be read.
+    orbit_hint: f32,
+    orbit_seen: f32,
     /// A game waiting for the drawer to shut before it goes in.
     pending_start: Option<usize>,
     /// Whether the machine's picture has anything in it yet: the console
@@ -740,6 +750,9 @@ impl GuiApp {
             selected: 0,
             art_zoom: false,
             console_spin: false,
+            auto_spin: true,
+            orbit_hint: 1.0,
+            orbit_seen: 0.0,
             pending_start: None,
             picture_live: false,
             console_fade: 1.0,
@@ -854,6 +867,9 @@ impl GuiApp {
                 self.status = format!("{title} inserted");
                 self.view = View::Machine;
                 self.fz1_tray_open = false;
+                // A new disc is a new boot: the machine stays on show until
+                // the core is drawing again.
+                self.picture_live = false;
                 if was_running {
                     self.emu.start();
                     self.emu.request_reset();
@@ -1640,6 +1656,8 @@ impl GuiApp {
         let turn = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
         if self.console_spin {
             self.fz1_state.yaw += turn * 0.7;
+        } else if self.auto_spin {
+            self.fz1_state.yaw += turn * 0.3;
         }
         self.fz1_state.lit = running;
         // The ACCESS lamp only ever shows disc access: it blinks while the
@@ -1684,6 +1702,8 @@ impl GuiApp {
             let drag = turn.drag_delta();
             self.fz1_state.yaw += drag.x * 0.01;
             self.fz1_state.pitch = (self.fz1_state.pitch - drag.y * 0.01).clamp(-1.2, 1.2);
+            // Taking hold of the machine ends the launch turn for good.
+            self.auto_spin = false;
         }
         if turn.hovered() {
             let wheel = ui.ctx().input(|i| i.smooth_scroll_delta.y);
@@ -1732,6 +1752,25 @@ impl GuiApp {
                 // ways; EJECT is what gives the disc back.
                 ("tray", _) => self.toggle_tray(),
                 _ => {}
+            }
+        }
+
+        // The orbit hint: a few seconds once the machine is on screen, or
+        // until the first drag shows it was not needed, then it fades and
+        // does not come back.
+        if self.orbit_hint > 0.0 {
+            self.orbit_seen += dt;
+            if self.orbit_seen > 6.0 || !self.auto_spin {
+                self.orbit_hint = (self.orbit_hint - dt / 1.2).max(0.0);
+            }
+            if self.orbit_hint > 0.0 {
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.max.y - 34.0),
+                    egui::Align2::CENTER_CENTER,
+                    "drag to rotate · wheel to zoom",
+                    egui::FontId::proportional(11.0),
+                    TEXT_DIM.gamma_multiply(self.orbit_hint),
+                );
             }
         }
 
@@ -1886,6 +1925,12 @@ impl GuiApp {
     /// departure is keyed off `picture_live`, so waiting for the picture view
     /// to ask would mean it never happened.
     fn poll_frame(&mut self) {
+        // Only consider real game rendering after the boot splash has finished.
+        // The emulator may already be running during the BIOS boot logo, which
+        // would otherwise set `picture_live` too early and cause the console to
+        // fade out before the game starts. Guard against this by requiring the
+        // splash timer to be cleared before we mark the picture as live.
+
         self.frame_dims = None;
         if !self.emu.running() {
             return;
@@ -1914,15 +1959,21 @@ impl GuiApp {
                         > 90
                 });
         });
-        if lit {
+        // Only set picture_live after the boot splash has cleared.
+        if lit && self.splash_until.is_none() {
             self.picture_live = true;
         }
     }
 
     /// The main area: the machine with its disc and pad until the core is
     /// drawing, then the machine slides away and the picture has the window.
+    /// What counts as live is the core's output, disc or not — a powered-on
+    /// machine with an empty tray still shows its BIOS boot and management
+    /// screens, exactly as the real hardware does on the TV. An open drawer
+    /// is the choosing state: the machine and the selector take the window
+    /// back until it shuts.
     fn view_picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let live = self.game.is_some() && self.emu.running() && self.picture_live;
+        let live = self.emu.running() && self.picture_live && !self.fz1_tray_open;
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
         let goal = if live { 0.0 } else { 1.0 };
         self.console_fade += (goal - self.console_fade).clamp(-dt / 0.5, dt / 0.5);
