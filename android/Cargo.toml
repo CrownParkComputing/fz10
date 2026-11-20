@@ -1,0 +1,23 @@
+[package]
+name = "retro3do-android"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The retro3do-gui launcher as the cdylib Android loads"
+
+[lib]
+name = "retro3do_gui"
+crate-type = ["cdylib"]
+
+[dependencies]
+retro3do = { path = "../app" }
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity"] }
+winit = { version = "0.30", features = ["android-native-activity"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+gltf = "1.4.1"
+bytemuck = "1.25.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

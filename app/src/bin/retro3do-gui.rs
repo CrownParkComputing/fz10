@@ -15,6 +15,8 @@
 
 #[path = "retro3do-gui/boot_logo.rs"]
 mod boot_logo;
+#[path = "retro3do-gui/case_art.rs"]
+mod case_art;
 #[path = "retro3do-gui/fz1_3d.rs"]
 mod fz1_3d;
 #[path = "retro3do-gui/gpu_scale.rs"]
@@ -36,8 +38,60 @@ use retro3do::{PadButton, Region, Retro3do, MAX_PADS};
 #[cfg(not(target_os = "android"))]
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
 
-const TILE_W: f32 = 190.0;
-const TILE_H: f32 = 108.0;
+/// A case spine's width over its height (a 14 mm spine on a 207 mm case,
+/// as the media folder's spine scans are cut).
+const SPINE_ASPECT: f32 = 146.0 / 2156.0;
+/// How many spines the shelf shows at once: a compact strip, not a wall.
+const SHELF_MAX_SPINES: usize = 20;
+/// How long the unboxing and the box-away run, in seconds.
+const UNBOX_SECS: f32 = 9.0;
+const BOXAWAY_SECS: f32 = 5.0;
+/// The presentation spin: the sealed carton turns once on the spot, slowly,
+/// before the lid opens, so every face of the retail box is seen.
+const SPIN_SECS: f32 = 6.0;
+/// The whole opening show: the spin, then the unboxing.
+const INTRO_SECS: f32 = SPIN_SECS + UNBOX_SECS;
+/// How far into the show the unboxing starts.
+const SPIN_FRAC: f32 = SPIN_SECS / INTRO_SECS;
+/// The yaw the machine view sits at: a three-quarter view, and where the
+/// presentation spin starts and lands.
+const YAW0: f32 = 0.42;
+/// How long the overlay icons stay up after the player's last touch while a
+/// game is on screen.
+const CHROME_IDLE: Duration = Duration::from_secs(3);
+
+/// One floating icon: a glyph on a dark pad, no frame and no label.
+fn icon_button(ui: &mut egui::Ui, glyph: &str, hint: &str) -> bool {
+    let size = egui::vec2(34.0, 34.0);
+    let (spot, press) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hot = press.hovered();
+    ui.painter().rect_filled(
+        spot,
+        6.0,
+        egui::Color32::from_black_alpha(if hot { 220 } else { 150 }),
+    );
+    ui.painter().text(
+        spot.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(18.0),
+        if hot { egui::Color32::WHITE } else { TEXT_DIM },
+    );
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    press.on_hover_text(hint).clicked()
+}
+
+/// Ease in and out of 0..1.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+/// The drawer's travel rate (full travel per second) and how long the
+/// platter spins up before the machine is switched on.
+const TRAY_RATE: f32 = 0.5;
+const SPINUP_SECS: f32 = 2.6;
 
 /// Audio the stream keeps buffered — about 93 ms at 44.1 kHz, deep enough to
 /// play through a stalled emulated field without a gap, thin enough that the
@@ -98,6 +152,49 @@ struct Config {
     /// Directory of hand-authored cel replacements (`<fnv>.png`, see
     /// src/texpack.rs); overrides the computed filter where it has a match.
     texdir: Option<PathBuf>,
+    /// Explicit artwork map: ROM stem and media set to artwork file.
+    name_map: HashMap<(String, String), String>,
+    /// Print where every game finds its artwork and stop.
+    resolve: bool,
+    /// The game picture filtered smoothly on the way up to the window,
+    /// instead of crisp nearest-neighbour pixels.
+    smooth: bool,
+    /// ARM work per field as a percentage of the real machine's: 100 is the
+    /// real thing, up to 150 for games the hardware itself struggled with.
+    cpu_scale: u32,
+    /// Which attached gamepad drives console pad 0.
+    pad_primary: usize,
+    /// The pad mapping: 3DO button name to SDL button name.
+    pad_bind: Vec<(String, String)>,
+}
+
+/// The stock pad mapping. Android takes its pads from the Java shim, which
+/// has a fixed mapping of its own, so there is nothing to bind there.
+fn default_bindings() -> Vec<(String, String)> {
+    #[cfg(not(target_os = "android"))]
+    {
+        sdl_pad::default_bindings()
+    }
+    #[cfg(target_os = "android")]
+    {
+        Vec::new()
+    }
+}
+
+/// A saved mapping as one settings-file value: `A:South,B:East,...`.
+fn bindings_to_text(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(three, sdl)| format!("{three}:{sdl}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn bindings_from_text(text: &str) -> Vec<(String, String)> {
+    text.split(',')
+        .filter_map(|pair| pair.split_once(':'))
+        .map(|(three, sdl)| (three.trim().to_string(), sdl.trim().to_string()))
+        .collect()
 }
 
 /// Shared, user-visible storage on Android: a folder a person can fill from a
@@ -190,6 +287,15 @@ impl Config {
                 "saves" => self.saves_dir = PathBuf::from(&value),
                 "media" => self.media_dir = PathBuf::from(&value),
                 "bios_file" => self.bios_choice = Some(value),
+                "smooth" => self.smooth = value == "true",
+                "cpu_scale" => self.cpu_scale = value.parse().unwrap_or(100).clamp(100, 150),
+                "pad_primary" => self.pad_primary = value.parse().unwrap_or(0),
+                "pad_bind" => {
+                    let bind = bindings_from_text(&value);
+                    if !bind.is_empty() {
+                        self.pad_bind = bind;
+                    }
+                }
                 _ => {}
             }
         }
@@ -202,12 +308,17 @@ impl Config {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let text = format!(
-            "games = {}\nbios = {}\nsaves = {}\nmedia = {}\nbios_file = {}\n",
+            "games = {}\nbios = {}\nsaves = {}\nmedia = {}\nbios_file = {}\n\
+             smooth = {}\ncpu_scale = {}\npad_primary = {}\npad_bind = {}\n",
             self.games_dir.display(),
             self.bios_dir.display(),
             self.saves_dir.display(),
             self.media_dir.display(),
             self.bios_choice.clone().unwrap_or_default(),
+            self.smooth,
+            self.cpu_scale,
+            self.pad_primary,
+            bindings_to_text(&self.pad_bind),
         );
         std::fs::write(&path, text).map_err(|e| e.to_string())
     }
@@ -225,6 +336,12 @@ impl Config {
             bios_choice: None,
             configured: false,
             texdir: std::env::var_os("RETRO3DO_TEXDIR").map(PathBuf::from),
+            name_map: HashMap::new(),
+            resolve: false,
+            smooth: false,
+            cpu_scale: 100,
+            pad_primary: 0,
+            pad_bind: default_bindings(),
         }
     }
 
@@ -235,7 +352,12 @@ impl Config {
         cfg.configured = configured;
         let mut args = std::env::args().skip(1);
         let mut dirs_set = false;
+        let mut resolve = false;
         while let Some(arg) = args.next() {
+            if arg == "--resolve" {
+                resolve = true;
+                continue;
+            }
             let value = args.next().ok_or_else(|| format!("{arg} wants a value"))?;
             match arg.as_str() {
                 "--games-dir" => {
@@ -273,6 +395,8 @@ impl Config {
         // Handed real paths on the command line counts as configured: the
         // walkthrough is for someone who has never run this before.
         cfg.configured = cfg.configured || dirs_set;
+        cfg.resolve = resolve;
+        cfg.name_map = load_name_map(&cfg);
         Ok(cfg)
     }
 }
@@ -288,21 +412,84 @@ struct Game {
     cover: Option<PathBuf>,
     /// The cover's decode key: its path as text.
     cover_key: Option<String>,
-    /// Disc label art matched from the media `cartridges` directory, if any.
+    /// The disc's own art: a real scan from the media `discs` directory
+    /// where there is one, else the `cartridges` art.
     disc_art: Option<PathBuf>,
     disc_key: Option<String>,
 }
 
-/// Lowercase, region tags removed, punctuation folded to spaces: the matching
-/// key for both a game filename and a media filename.
+/// Words that mark a bracket as a region, language or revision tag rather
+/// than part of the title: "(USA)", "(USA, Europe)", "(En,Fr)", "(RE1)".
+const TAG_WORDS: &[&str] = &[
+    "usa", "europe", "japan", "korea", "asia", "australia", "brazil", "canada", "china",
+    "germany", "france", "italy", "spain", "uk", "netherlands", "sweden", "norway", "finland",
+    "denmark", "portugal", "poland", "russia", "czech", "republic", "greece", "turkey",
+    "israel", "arabic", "hebrew", "hindi", "taiwan", "world", "intl", "international", "multi",
+    "en", "fr", "de", "es", "it", "ja", "ko", "pt", "nl", "sv", "no", "da", "fi", "pl", "ru",
+    "cs", "el", "tr", "zh", "ar", "he", "hi", "th", "vi", "id", "ms",
+    "re", "rev", "beta", "demo", "proto", "prototype", "alpha", "prerelease", "trial", "debug",
+];
+
+/// Whether a bracketed group says only where the disc came from: every word
+/// in it is a region, a language or a revision marker.
+fn is_tag_group(content: &str) -> bool {
+    // "RE1", "rev2", "v1.0": a revision marker with a number on it.
+    let revision = |word: &str, stem: &str| {
+        word.len() > stem.len()
+            && word.starts_with(stem)
+            && word[stem.len()..].chars().all(|c| c.is_ascii_digit())
+    };
+    let mut any = false;
+    for word in content.split(|c: char| !c.is_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        any = true;
+        let lower = word.to_ascii_lowercase();
+        if TAG_WORDS.contains(&lower.as_str())
+            || lower.chars().all(|c| c.is_ascii_digit())
+            || revision(&lower, "re")
+            || revision(&lower, "rev")
+            || revision(&lower, "v")
+        {
+            continue;
+        }
+        return false;
+    }
+    any
+}
+
+/// Lowercase, region and revision tags dropped, punctuation folded to spaces:
+/// the matching key for both a game filename and a media filename.
 fn normalize(stem: &str) -> String {
-    let mut out = String::with_capacity(stem.len());
-    let mut depth = 0i32;
-    for ch in stem.chars() {
+    let mut text = String::with_capacity(stem.len());
+    let mut rest = stem;
+    loop {
+        let Some(open) = rest.find(['(', '[']) else {
+            text.push_str(rest);
+            break;
+        };
+        text.push_str(&rest[..open]);
+        let close = if rest[open..].starts_with('(') { ')' } else { ']' };
+        let tail = &rest[open + 1..];
+        let Some(end) = tail.find(close) else {
+            text.push_str(tail);
+            break;
+        };
+        let content = &tail[..end];
+        // A group that is only region and revision noise goes; "(Disc 2)"
+        // stays, because it tells one disc of a set from another.
+        if !is_tag_group(content) {
+            text.push(' ');
+            text.push_str(content);
+            text.push(' ');
+        }
+        rest = &tail[end + 1..];
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
         match ch {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth = depth.saturating_sub(1),
-            _ if depth > 0 => {}
             '&' => out.push_str(" and "),
             c if c.is_alphanumeric() => out.extend(c.to_lowercase()),
             _ => out.push(' '),
@@ -311,12 +498,10 @@ fn normalize(stem: &str) -> String {
     // ", The" moves to the front in some scrapers; the media library uses it.
     // Dropping the word entirely makes "The Need for Speed" and "Need for
     // Speed, The" the same key.
-    let collapsed = out
-        .split_whitespace()
+    out.split_whitespace()
         .filter(|w| *w != "the")
         .collect::<Vec<_>>()
-        .join(" ");
-    collapsed
+        .join(" ")
 }
 
 fn file_stem(p: &Path) -> String {
@@ -351,9 +536,160 @@ fn scan_dir(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
     out
 }
 
+/// The explicit artwork map: "ROM stem <TAB> media set <TAB> artwork file",
+/// one line each. It names the file for a game whose artwork does not carry
+/// the game's own name.
+fn load_name_map(cfg: &Config) -> HashMap<(String, String), String> {
+    let mut map = HashMap::new();
+    let mut paths = Vec::new();
+    if let Some(parent) = cfg.games_dir.parent() {
+        paths.push(parent.join("name-map.tsv"));
+    }
+    paths.push(cfg.media_dir.join("name-map.tsv"));
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let (Some(rom), Some(set), Some(file)) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            map.insert((rom.to_string(), set.to_string()), file.to_string());
+        }
+        if !map.is_empty() {
+            break;
+        }
+    }
+    map
+}
+
+/// The artwork for one game in one media set: the explicit map first, then the
+/// name match. `sets` is the order the sets are tried in.
+fn resolve_media(
+    cfg: &Config,
+    rom_stem: &str,
+    sets: &[&str],
+    candidates: &[PathBuf],
+) -> Option<PathBuf> {
+    for set in sets {
+        let Some(file) = cfg.name_map.get(&(rom_stem.to_string(), (*set).to_string())) else {
+            continue;
+        };
+        let hit = candidates.iter().find(|c| {
+            c.parent()
+                .and_then(|p| p.file_name())
+                .map(|d| d.to_string_lossy().into_owned())
+                .is_some_and(|d| d == *set)
+                && c.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .is_some_and(|n| n == *file)
+        });
+        if hit.is_some() {
+            return hit.cloned();
+        }
+    }
+    if let Some(hit) = match_media(&normalize(rom_stem), candidates) {
+        return Some(hit.clone());
+    }
+    // One disc of a set: the set's own artwork stands in for the disc.
+    if let Some((base, _)) = disc_tag(rom_stem) {
+        return resolve_media(cfg, &base, sets, candidates);
+    }
+    None
+}
+
+/// Print where every game finds its artwork, one line per game and media set:
+/// the check that the artwork names line up with the disc names.
+fn resolve_report(cfg: &Config) {
+    let sets = [
+        "box2d", "boxback", "spine", "discs", "cartridges", "images", "marquee", "titles",
+        "fanarts", "thumbnails",
+    ];
+    // The library card's own pick: the first set that has the game's cover.
+    let covers: Vec<PathBuf> = ["box2d", "images", "thumbnails", "titles"]
+        .iter()
+        .flat_map(|set| scan_dir(&cfg.media_dir.join(set), &["png", "jpg", "jpeg"]))
+        .collect();
+    for path in scan_dir(&cfg.games_dir, &["chd", "iso", "cue", "bin", "img"]) {
+        let stem = file_stem(&path);
+        println!(
+            "{}\tcover\t{}",
+            stem,
+            resolve_media(cfg, &stem, &["box2d", "images", "thumbnails", "titles"], &covers)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        for set in sets {
+            let candidates = scan_dir(&cfg.media_dir.join(set), &["png", "jpg", "jpeg"]);
+            let hit = resolve_media(cfg, &stem, &[set], &candidates);
+            println!(
+                "{}\t{}\t{}",
+                stem,
+                set,
+                hit.map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+    }
+}
+
+/// The real disc scan for a game, from the `discs` media set.
+///
+/// A scan belongs to exactly one game, so the match is on the title alone:
+/// the game's own scan, or the first disc of a set, and never a longer
+/// title that merely contains it.
+fn resolve_disc_scan(cfg: &Config, stem: &str, scans: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(file) = cfg.name_map.get(&(stem.to_string(), "discs".to_string())) {
+        if let Some(hit) = scans.iter().find(|c| {
+            c.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .as_deref()
+                == Some(file.as_str())
+        }) {
+            return Some(hit.clone());
+        }
+    }
+    let (want_base, want_number) = match disc_tag(stem) {
+        Some((base, number)) => (normalize(&base), Some(number)),
+        None => (normalize(stem), None),
+    };
+    let mut best: Option<(u8, &PathBuf)> = None;
+    for scan in scans {
+        let name = file_stem(scan);
+        let (base, number) = match disc_tag(&name) {
+            Some((base, number)) => (normalize(&base), number),
+            None => (normalize(&name), 1),
+        };
+        if base != want_base {
+            continue;
+        }
+        // A set wants its own disc; a single-disc game takes disc one.
+        let score = match want_number {
+            Some(want) if want == number => 0,
+            Some(_) => continue,
+            None => u8::from(number != 1),
+        };
+        if best.is_none_or(|(s, _)| score < s) {
+            best = Some((score, scan));
+        }
+    }
+    best.map(|(_, scan)| scan.clone())
+}
+
 /// Longest normalized media stem that appears inside the game's stem, or the
 /// reverse. Earlier candidates win ties, so ordered dirs give the preference.
 fn match_media<'a>(stem: &str, candidates: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    // Exact first: "Alone in the Dark" must not pick up "Alone in the Dark
+    // 2" just because that name is longer.
+    if let Some(exact) = candidates.iter().find(|c| normalize(&file_stem(c)) == stem) {
+        return Some(exact);
+    }
     let mut best: Option<(usize, &PathBuf)> = None;
     for cand in candidates {
         let key = normalize(&file_stem(cand));
@@ -374,6 +710,7 @@ fn scan_games(cfg: &Config) -> Vec<Game> {
         covers.extend(scan_dir(&cfg.media_dir.join(sub), &["png", "jpg", "jpeg"]));
     }
     let disc_art = scan_dir(&cfg.media_dir.join("cartridges"), &["png", "jpg", "jpeg"]);
+    let disc_scans = scan_dir(&cfg.media_dir.join("discs"), &["png", "jpg", "jpeg"]);
 
     // A title that spans discs is one entry. An `.m3u` beside them says so
     // outright and fixes the order; without one, "Disc 2"/"CD2" and their
@@ -416,16 +753,17 @@ fn scan_games(cfg: &Config) -> Vec<Game> {
         if listed.contains(&path_key(&path)) {
             continue;
         }
-        let stem = normalize(&file_stem(&path));
-        let cover = match_media(&stem, &covers);
-        let disc = match_media(&stem, &disc_art);
+        let stem = file_stem(&path);
+        let cover = resolve_media(cfg, &stem, &["box2d", "images", "thumbnails", "titles"], &covers);
+        let disc = resolve_disc_scan(cfg, &stem, &disc_scans)
+            .or_else(|| resolve_media(cfg, &stem, &["cartridges"], &disc_art));
         games.push(Game {
             discs: vec![path.clone()],
             title: file_stem(&path),
-            cover_key: cover.map(|c| c.to_string_lossy().into_owned()),
-            cover: cover.cloned(),
-            disc_key: disc.map(|d| d.to_string_lossy().into_owned()),
-            disc_art: disc.cloned(),
+            cover_key: cover.as_ref().map(|c| c.to_string_lossy().into_owned()),
+            cover,
+            disc_key: disc.as_ref().map(|d| d.to_string_lossy().into_owned()),
+            disc_art: disc,
             path,
         });
     }
@@ -435,16 +773,16 @@ fn scan_games(cfg: &Config) -> Vec<Game> {
         let Some(first) = discs.first().cloned() else {
             continue;
         };
-        let stem = normalize(&title);
-        let cover = match_media(&stem, &covers);
-        let label = match_media(&stem, &disc_art);
+        let cover = resolve_media(cfg, &title, &["box2d", "images", "thumbnails", "titles"], &covers);
+        let label = resolve_disc_scan(cfg, &title, &disc_scans)
+            .or_else(|| resolve_media(cfg, &title, &["cartridges"], &disc_art));
         games.push(Game {
             discs,
             title,
-            cover_key: cover.map(|c| c.to_string_lossy().into_owned()),
-            cover: cover.cloned(),
-            disc_key: label.map(|d| d.to_string_lossy().into_owned()),
-            disc_art: label.cloned(),
+            cover_key: cover.as_ref().map(|c| c.to_string_lossy().into_owned()),
+            cover,
+            disc_key: label.as_ref().map(|d| d.to_string_lossy().into_owned()),
+            disc_art: label,
             path: first,
         });
     }
@@ -638,6 +976,19 @@ impl SoundAndPads {
             }
         }
     }
+
+    /// Put the saved mapping in force.
+    fn set_bindings(&mut self, pairs: &[(String, String)]) {
+        if let Some(g) = self.gamepads.as_mut() {
+            g.set_bindings(pairs);
+        }
+    }
+
+    /// The SDL button held down on a pad, by name: what the remap page
+    /// listens for.
+    fn pressed(&self, index: usize) -> Option<&'static str> {
+        self.gamepads.as_ref().and_then(|g| g.pressed(index))
+    }
 }
 
 /// Android pads: one physical gamepad, mapped onto console pad 0 beside the
@@ -673,6 +1024,13 @@ impl SoundAndPads {
     /// The Java shim delivers Android pads as they happen, so there is
     /// nothing to look for here.
     fn refresh(&mut self) {}
+
+    /// The Android shim's mapping is its own and fixed.
+    fn set_bindings(&mut self, _pairs: &[(String, String)]) {}
+
+    fn pressed(&self, _index: usize) -> Option<&'static str> {
+        None
+    }
 }
 
 /// The JNI shim in `android/src/lib.rs` hands the activity's key events here.
@@ -723,6 +1081,54 @@ enum View {
 
     /// First run: where everything lives, and which BIOS to boot.
     Setup,
+
+    /// The settings page, filling the window on its own.
+    Settings,
+}
+
+/// Which part of the settings page is on show. The page is a page, not a
+/// dialog: the sections live down the left and one of them is on screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Controller,
+    Video,
+    Paths,
+    System,
+}
+
+/// The sections of the settings page, in the order they are listed.
+const SETTINGS_TABS: [(SettingsTab, &str, &str); 4] = [
+    (SettingsTab::Controller, "Controller", "the pad and its buttons"),
+    (SettingsTab::Video, "Video", "how the picture is drawn"),
+    (SettingsTab::Paths, "Paths", "where the library lives"),
+    (SettingsTab::System, "System", "the BIOS and the CPU"),
+];
+
+/// The heading at the top of a settings section.
+fn settings_head(ui: &mut egui::Ui, title: &str, blurb: &str) {
+    ui.label(egui::RichText::new(title).size(22.0).strong());
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(blurb).color(TEXT_DIM));
+    ui.add_space(18.0);
+}
+
+/// One card inside a settings section: its name, and whatever it holds.
+fn settings_card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::NONE
+        .fill(CARD)
+        .inner_margin(18)
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(title)
+                    .size(15.0)
+                    .strong()
+                    .color(TEXT_DIM),
+            );
+            ui.add_space(12.0);
+            add(ui);
+        });
 }
 
 struct GuiApp {
@@ -751,32 +1157,53 @@ struct GuiApp {
     fz1: Option<fz1_3d::Fz1Renderer>,
     fz1_state: fz1_3d::Fz1State,
     fz1_tried: bool,
-    /// The artwork currently on the model's disc, by its file path, so it is
-    /// uploaded once per game rather than every frame, and whether anything
-    /// has been put on the platter yet.
+    /// The picture asked for the model's disc, by its file path, so it is
+    /// decoded once per game rather than every frame.
     fz1_disc_art: Option<PathBuf>,
-    fz1_disc_set: bool,
     /// Media paths already asked of the decode thread.
     art_asked: std::collections::HashSet<String>,
-    /// Where the selector is pointing: slot 0 is the empty tray, and the
-    /// games follow it.
-    selected: usize,
-    /// The box art opened up, front and back side by side.
-    art_zoom: bool,
-    /// Whether the machine and the pads turn on their own.
-    console_spin: bool,
-    /// The slow turn the machine makes on launch, before anyone has taken
-    /// hold of it. The first drag ends it for good; the ⟳ control's spin is
-    /// a separate, asked-for thing.
-    auto_spin: bool,
+    /// The title the shelf last pointed at (the header names it).
+    selected: Option<usize>,
+    /// The spine and back-cover scans each game has, matched once per scan.
+    spines: Vec<Option<PathBuf>>,
+    backs: Vec<Option<PathBuf>>,
+    /// How far the shelf has scrolled when it is wider than the window.
+    shelf_scroll: f32,
+    /// The case being looked at in the upper view, and the game whose
+    /// artwork is in the case model's slots.
+    case_open: Option<usize>,
+    case_art_for: Option<usize>,
+    /// Composed artwork coming back from worker threads: which slot, the
+    /// key it was asked for under, and the RGBA pixels.
+    slot_tx: Sender<(fz1_3d::ArtSlot, String, Vec<u8>)>,
+    slot_rx: Receiver<(fz1_3d::ArtSlot, String, Vec<u8>)>,
+    /// The platter picture that has actually reached the GPU.
+    fz1_disc_uploaded: Option<PathBuf>,
+    /// A disc on its way into the machine.
+    load: Option<Load>,
+    /// The opening show, 0 (sealed, about to spin) to 1 (done), and the
+    /// box-away on close.
+    intro: f32,
+    /// Whether the presentation spin has finished, after which nothing but a
+    /// hand turns the machine.
+    spun: bool,
+    /// When the player last touched anything: the overlay icons hide again
+    /// three seconds later while a game is on screen.
+    chrome_woke: Instant,
+    closing: Option<f32>,
+    close_now: bool,
+    /// The launcher shown over a running game (which is paused under it).
+    frontend: bool,
+    /// The automation script (RETRO3DO_SCRIPT) and screenshots waiting to
+    /// be written.
+    script: Vec<(f32, String)>,
+    shots: std::collections::VecDeque<String>,
     /// Opacity of the "drag to rotate" hint: 1 while it is new, draining to
     /// 0 once it has had its moment or been acted on. `orbit_seen` counts the
     /// seconds the machine has been on screen as a control, so the hint's
     /// moment is measured by when it could actually be read.
     orbit_hint: f32,
     orbit_seen: f32,
-    /// A game waiting for the drawer to shut before it goes in.
-    pending_start: Option<usize>,
     /// Whether the machine's picture has anything in it yet: the console
     /// stays on screen until the core is actually drawing, then slides and
     /// fades out over about half a second (`console_fade` 1.0 = console
@@ -795,18 +1222,13 @@ struct GuiApp {
     setup_media: String,
     picker: Option<PathBuf>,
     picker_step: usize,
-    /// When the window opened, and until when the boot-logo splash holds the
-    /// screen once the extracted artwork has arrived.
+    /// When the window opened.
     launched: Instant,
-    splash_until: Option<Instant>,
     /// How far the badge wallpaper has drifted, in points.
     wall_drift: f32,
     /// Whether the model's drawer is out. The machine's own open/close button
     /// toggles it; powering on shuts it.
     fz1_tray_open: bool,
-    /// How far the drawer zoom has come in, 0 to 1: eased toward the tray
-    /// state so the eye closes on the drawer as it opens.
-    drawer_zoom: f32,
     /// The wheel's own zoom, kept apart from the drawer zoom so the two do
     /// not fight.
     fz1_user_zoom: f32,
@@ -832,13 +1254,92 @@ struct GuiApp {
     disc_speed: f32,
     status: String,
     last_nvram_save: Instant,
+    /// Frame-interval instrumentation, kept only while RETRO3DO_FRAME_LOG is
+    /// set: when the picture last reached the screen, when the machine last
+    /// published a field, and the gaps gathered since the last report.
+    present_last: Option<Instant>,
+    field_last: Option<Instant>,
+    present_gaps: Vec<f64>,
+    field_gaps: Vec<f64>,
+    /// Where the settings page came from, so the way back lands there, the
+    /// section of it on show, and which 3DO button (an index into
+    /// `sdl_pad::THREE_DO`) is waiting for a pad button to be pressed.
+    settings_back: View,
+    settings_tab: SettingsTab,
+    rebind: Option<usize>,
+    /// A scroll position the script harness has asked the settings page to
+    /// jump to, taken once so the wheel still works the rest of the time.
+    settings_scroll: Option<f32>,
+    /// The folders being typed on the settings page, applied on the button.
+    set_dirs: Option<(String, String, String)>,
 }
 
 /// Which title the platter wears: the disc that is in the drive, never the
 /// one merely highlighted in the shelf. A disc that has just been ejected
-/// stays on the platter while the spindle coasts down.
-fn platter_title(game: Option<usize>, disc_loaded: bool, spinning: bool) -> Option<usize> {
-    game.filter(|_| disc_loaded || spinning)
+/// stays on the platter while the spindle coasts down, and then rides out
+/// on the open drawer, where it sits waiting to be taken or swapped.
+fn platter_title(
+    game: Option<usize>,
+    disc_loaded: bool,
+    spinning: bool,
+    tray_open: bool,
+) -> Option<usize> {
+    game.filter(|_| disc_loaded || spinning || tray_open)
+}
+
+/// The steps of putting a disc in, each played at the machine's own pace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoadStep {
+    /// The drawer runs out and whatever disc was in it lifts away.
+    Eject,
+    /// The new disc comes down onto the platter.
+    Place,
+    /// The drawer shuts on it.
+    Close,
+    /// The platter comes up to speed; then the machine is switched on.
+    SpinUp,
+}
+
+struct Load {
+    game: usize,
+    step: LoadStep,
+    t: f32,
+}
+
+/// A spine for a title with no spine scan: the stock colour the case art
+/// uses for it, and the name — without the scraper's region tags — set
+/// down its length the way a shelf reads.
+fn text_spine(painter: &egui::Painter, rect: egui::Rect, title: &str, alpha: f32) {
+    let [r, g, b, _] = case_art::spine_paper(title).0;
+    painter.rect_filled(rect, 1.0, egui::Color32::from_rgb(r, g, b).gamma_multiply(alpha));
+    let name = case_art::clean_title(title).to_uppercase();
+    let ink = egui::Color32::from_rgb(232, 232, 236).gamma_multiply(alpha);
+    let mut size = (rect.width() * 0.74).clamp(8.0, 22.0);
+    let galley = loop {
+        let galley = painter.layout_no_wrap(name.clone(), egui::FontId::proportional(size), ink);
+        if galley.size().x <= rect.height() - 14.0 || size <= 6.0 {
+            break galley;
+        }
+        size -= 0.5;
+    };
+    // Turned a quarter clockwise: the text runs down the spine, its top
+    // toward the right edge, centred both ways.
+    let gs = galley.size();
+    let at = egui::pos2(rect.center().x + gs.y * 0.5, rect.center().y - gs.x * 0.5);
+    painter.add(egui::epaint::TextShape::new(at, galley, ink).with_angle(std::f32::consts::FRAC_PI_2));
+}
+
+/// The automation script: `secs:action[:arg]` entries split by `;`.
+fn parse_script(text: &str) -> Vec<(f32, String)> {
+    let mut out: Vec<(f32, String)> = text
+        .split(';')
+        .filter_map(|e| {
+            let (at, action) = e.trim().split_once(':')?;
+            Some((at.trim().parse().ok()?, action.trim().to_string()))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out
 }
 
 impl GuiApp {
@@ -898,6 +1399,7 @@ impl GuiApp {
         };
         queue_art(&job_tx, &games);
 
+        let (slot_tx, slot_rx) = channel();
         let mut app = Self {
             emu: Retro3do::new(),
             io: SoundAndPads::open(),
@@ -918,23 +1420,38 @@ impl GuiApp {
                 zoom: 1.0,
                 // A three-quarter view: the deck reads as an object, and the
                 // power and eject buttons are still face on enough to hit.
-                yaw: 0.42,
+                yaw: YAW0,
                 pitch: 0.38,
-                pad_yaw: 0.0,
-                pad_pitch: 1.25,
+                case_yaw: 0.35,
+                case_pitch: 0.12,
+                case_zoom: 1.0,
                 ..Default::default()
             },
             fz1_tried: false,
             fz1_disc_art: None,
-            fz1_disc_set: false,
             art_asked: std::collections::HashSet::new(),
-            selected: 0,
-            art_zoom: false,
-            console_spin: false,
-            auto_spin: true,
+            selected: None,
+            spines: Vec::new(),
+            backs: Vec::new(),
+            shelf_scroll: 0.0,
+            case_open: None,
+            case_art_for: None,
+            slot_tx,
+            slot_rx,
+            fz1_disc_uploaded: None,
+            load: None,
+            intro: 0.0,
+            spun: false,
+            chrome_woke: Instant::now(),
+            closing: None,
+            close_now: false,
+            frontend: false,
+            script: std::env::var("RETRO3DO_SCRIPT")
+                .map(|s| parse_script(&s))
+                .unwrap_or_default(),
+            shots: std::collections::VecDeque::new(),
             orbit_hint: 1.0,
             orbit_seen: 0.0,
-            pending_start: None,
             picture_live: false,
             console_fade: 1.0,
             frame_dims: None,
@@ -945,11 +1462,9 @@ impl GuiApp {
             picker: None,
             picker_step: 0,
             launched: Instant::now(),
-            splash_until: None,
             wall_drift: 0.0,
             fz1_tray_open: true,
-            drawer_zoom: 0.0,
-            fz1_user_zoom: 0.65,
+            fz1_user_zoom: 1.0,
             game: None,
             disc_index: 0,
             guest_tray_since: None,
@@ -961,6 +1476,15 @@ impl GuiApp {
             disc_speed: 0.0,
             status: String::new(),
             last_nvram_save: Instant::now(),
+            present_last: None,
+            field_last: None,
+            present_gaps: Vec::new(),
+            field_gaps: Vec::new(),
+            settings_back: View::Machine,
+            settings_tab: SettingsTab::Controller,
+            rebind: None,
+            settings_scroll: None,
+            set_dirs: None,
             cfg,
         };
         app.refresh_covers();
@@ -969,6 +1493,12 @@ impl GuiApp {
         // someone puts something in it.
         app.game = None;
         app.fz1_tray_open = false;
+        // The saved settings put in force before anything runs.
+        app.emu.set_cpu_scale_percent(app.cfg.cpu_scale);
+        let bind = app.cfg.pad_bind.clone();
+        if let Some(io) = app.io.as_mut() {
+            io.set_bindings(&bind);
+        }
         if app.bios_choice.is_none() {
             app.bios_choice = app.cfg.bios_choice.clone().or_else(|| app.bioses.first().cloned());
         }
@@ -984,22 +1514,14 @@ impl GuiApp {
             .push((LOGO_KEY.to_string(), boot_logo::render()));
         app.pending_images
             .push((WALL_KEY.to_string(), boot_logo::badge()));
-        if app.cfg.boot.is_none() && app.cfg.play.is_none() {
-            app.splash_until = Some(app.launched + Duration::from_millis(1800));
-        }
         // The real boot logo, pulled out of the chosen BIOS by the core
         // itself, arrives on the artwork channel like any other picture.
         app.extract_logo();
-        if let Some(b) = app.cfg.boot {
-            if b < app.games.len() {
-                app.insert_disc(b);
-            }
-        }
-        if let Some(p) = app.cfg.play {
-            if p < app.games.len() {
-                app.insert_disc(p);
-                app.power_on();
-            }
+        // Nothing boots by itself: --boot and --play only point the shelf at
+        // a title. The machine comes out of its box powered off and empty.
+        app.selected = app.cfg.play.or(app.cfg.boot).filter(|&g| g < app.games.len());
+        if app.view == View::Setup {
+            app.intro = 1.0;
         }
         app
     }
@@ -1019,12 +1541,20 @@ impl GuiApp {
     /// decodes for any image not already in the texture cache.
     /// Box fronts for the library cards.
     fn refresh_covers(&mut self) {
+        let exts = ["png", "jpg", "jpeg"];
+        for (sub, into) in [("spine", &mut self.spines), ("boxback", &mut self.backs)] {
+            let cands = scan_dir(&self.cfg.media_dir.join(sub), &exts);
+            *into = self
+                .games
+                .iter()
+                .map(|g| resolve_media(&self.cfg, &file_stem(&g.path), &[sub], &cands))
+                .collect();
+        }
         let cands = scan_dir(&self.cfg.media_dir.join("box2d"), &["png", "jpg", "jpeg"]);
         for g in &mut self.games {
-            let stem = normalize(&file_stem(&g.path));
-            let m = match_media(&stem, &cands);
-            g.cover_key = m.map(|c| c.to_string_lossy().into_owned());
-            g.cover = m.cloned();
+            let m = resolve_media(&self.cfg, &file_stem(&g.path), &["box2d"], &cands);
+            g.cover_key = m.as_ref().map(|c| c.to_string_lossy().into_owned());
+            g.cover = m;
             if let (Some(k), Some(p)) = (&g.cover_key, &g.cover) {
                 if !self.covers.contains_key(k) {
                     let _ = self.cover_tx.send((k.clone(), p.clone()));
@@ -1137,37 +1667,12 @@ impl GuiApp {
         }
     }
 
-    /// Take the disc out. The machine keeps running and falls back to the
-    /// BIOS, which is what the console does with an empty tray.
-    fn eject_disc(&mut self) {
-        self.save_nvram();
-        let running = self.emu.running();
-        if running {
-            self.emu.stop();
-        }
-        self.emu.eject_disc();
-        // The disc is out of the drive but still on the platter: it coasts
-        // down like real hardware does. The launcher forgets the disc once
-        // the spindle has stopped.
-        self.disc_index = 0;
-        self.guest_tray_since = None;
-        self.fz1_tray_open = true;
-        self.pending_start = None;
-        self.picture_live = false;
-        self.status = "disc out — the BIOS is waiting".to_string();
-        self.view = View::Machine;
-        if running {
-            self.emu.start();
-            self.emu.request_reset();
-        }
-    }
-
     /// The drive can empty without the launcher doing it: the BIOS ejects
     /// the disc, or a guest asks for the next one of a set. What the machine
     /// shows has to follow the drive, not the last thing the launcher did,
     /// so it never claims a disc that is not in it.
     fn sync_disc_state(&mut self) {
-        if self.game.is_some() && !self.emu.disc_loaded() {
+        if self.game.is_some() && self.emu.running() && !self.emu.disc_loaded() {
             self.status = "disc out — the BIOS is waiting".to_string();
         }
     }
@@ -1203,8 +1708,10 @@ impl GuiApp {
             // the thread starts, so the reset lands before the first field.
             self.emu.request_reset();
         }
+        self.emu.set_paused(false);
         self.emu.start();
         self.picture_live = false;
+        self.frontend = false;
         self.fz1_tray_open = false;
         self.status.clear();
         self.view = View::Machine;
@@ -1218,7 +1725,7 @@ impl GuiApp {
         self.view = View::Machine;
     }
 
-    /// The gamepads SDL reports, for the launcher's status line.
+    /// The gamepads SDL reports, for the settings page.
     fn pad_names(&self) -> Vec<String> {
         self.io.as_ref().map_or_else(Vec::new, |io| io.names())
     }
@@ -1229,16 +1736,21 @@ impl GuiApp {
         // always works even without mapping keys. Extra gamepads chain behind.
         let keys = keyboard_mask(ctx);
         let mut mask = keys;
+        let primary = self.cfg.pad_primary;
         if let Some(io) = self.io.as_mut() {
             io.refresh();
-            mask |= io.pad_mask(0);
-            for i in 1..io.count() {
-                let idx = i as u32;
-                if idx < MAX_PADS {
-                    self.emu.pads().set_buttons(idx, io.pad_mask(i));
-                    self.emu.pads().set_connected(idx, true);
-                    connected = idx + 1;
+            mask |= io.pad_mask(primary);
+            // The chosen pad is console pad 0 with the keyboard; the rest
+            // chain behind it in the order SDL reports them.
+            let mut idx = 1u32;
+            for i in 0..io.count() {
+                if i == primary || idx >= MAX_PADS {
+                    continue;
                 }
+                self.emu.pads().set_buttons(idx, io.pad_mask(i));
+                self.emu.pads().set_connected(idx, true);
+                connected = idx + 1;
+                idx += 1;
             }
         }
         self.emu.pads().set_buttons(0, mask);
@@ -1556,12 +2068,22 @@ impl GuiApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("use this folder").clicked() {
-                                let field = match self.picker_step {
-                                    1 => &mut self.setup_bios,
-                                    2 => &mut self.setup_games,
-                                    _ => &mut self.setup_media,
-                                };
-                                *field = current.to_string_lossy().into_owned();
+                                let chosen = current.to_string_lossy().into_owned();
+                                match self.picker_step {
+                                    1 => self.setup_bios = chosen,
+                                    2 => self.setup_games = chosen,
+                                    // The settings page's own three fields.
+                                    11..=13 => {
+                                        if let Some(d) = self.set_dirs.as_mut() {
+                                            match self.picker_step {
+                                                11 => d.0 = chosen,
+                                                12 => d.1 = chosen,
+                                                _ => d.2 = chosen,
+                                            }
+                                        }
+                                    }
+                                    _ => self.setup_media = chosen,
+                                }
                                 self.picker = None;
                             }
                             if ui.button("cancel").clicked() {
@@ -1575,47 +2097,6 @@ impl GuiApp {
 
     /// Both covers, opened up side by side over the picture. A click puts
     /// them away again.
-    fn art_overlay(&mut self, ctx: &egui::Context) {
-        let screen = ctx.content_rect();
-        egui::Area::new(egui::Id::new("art-zoom"))
-            .fixed_pos(screen.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let (rect, press) =
-                    ui.allocate_exact_size(screen.size(), egui::Sense::click());
-                ui.painter()
-                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(230));
-                let pad = 24.0;
-                let half = (rect.width() - pad * 3.0) * 0.5;
-                let height = rect.height() - pad * 2.0;
-                let Some(game) = self.selected_game() else {
-                    self.art_zoom = false;
-                    return;
-                };
-                for (i, sub) in ["box2d", "boxback"].iter().enumerate() {
-                    let at = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x + pad + (half + pad) * i as f32, rect.min.y + pad),
-                        egui::vec2(half, height),
-                    );
-                    let path = self.games.get(game).and_then(|g| self.media_for(g, sub));
-                    if let Some(id) = path.and_then(|p| self.art_texture(p.as_path())) {
-                        ui.painter().image(
-                            id,
-                            at,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
-                        );
-                    }
-                }
-                if press.clicked() {
-                    self.art_zoom = false;
-                }
-            });
-    }
-
     /// Pull the boot logo out of the chosen BIOS on a worker thread and send
     /// it to the texture cache like any other artwork.
     fn extract_logo(&self) {
@@ -1678,15 +2159,10 @@ impl GuiApp {
 
     /// A game's picture from one of the media sets (`box2d`, `boxback`,
     /// `marquee`, `cartridges`…), by path.
-    fn media_for(&self, game: &Game, sub: &str) -> Option<PathBuf> {
-        let candidates = scan_dir(&self.cfg.media_dir.join(sub), &["png", "jpg", "jpeg"]);
-        let stem = normalize(&file_stem(&game.path));
-        match_media(&stem, &candidates).cloned()
-    }
-
-    /// The disc-label picture: the art that belongs on a disc.
+    /// The disc-label picture: the art that belongs on a disc — the game's
+    /// own scan where the media folder has one.
     fn disc_label(&self, game: &Game) -> Option<PathBuf> {
-        self.media_for(game, "cartridges")
+        game.disc_art.clone()
     }
 
     /// The extracted boot logo, letterboxed at `fill` of the area's height.
@@ -1721,156 +2197,356 @@ impl GuiApp {
         None
     }
 
-    /// The game selector: seven marquees at a time with the chosen one in
-    /// the middle. Clicking a neighbour walks to it; clicking the middle one
-    /// puts it in and closes the drawer.
-    fn game_selector(&mut self, ui: &mut egui::Ui, height: f32) {
-        if self.games.is_empty() {
-            ui.label(
-                egui::RichText::new("no discs in the library folder")
-                    .small()
-                    .color(TEXT_DIM),
-            );
+    /// What the disc on the platter wears: the game's own disc art, never
+    /// its cover, or a drawn platter for a title with no disc art.
+    fn platter_art(&self, index: usize) -> Option<PathBuf> {
+        let game = self.games.get(index)?;
+        self.disc_label(game)
+            .or_else(|| Some(PathBuf::from(format!("title:{}", game.title))))
+    }
+
+    /// Ask a worker for the platter picture; it comes back on `slot_rx`.
+    fn request_platter(&self, art: PathBuf) {
+        let tx = self.slot_tx.clone();
+        std::thread::spawn(move || {
+            let key = art.to_string_lossy().into_owned();
+            let rgba = match key.strip_prefix("title:") {
+                Some(title) => case_art::disc(&case_art::CaseArt {
+                    title: title.to_string(),
+                    ..Default::default()
+                })
+                .as_raw()
+                .to_vec(),
+                None => {
+                    // The game's own scan, cut the way the case's disc is.
+                    case_art::disc(&case_art::CaseArt {
+                        disc: Some(art.clone()),
+                        ..Default::default()
+                    })
+                    .as_raw()
+                    .to_vec()
+                }
+            };
+            let _ = tx.send((fz1_3d::ArtSlot::Platter, key, rgba));
+        });
+    }
+
+    /// Ask a worker to dress the case for `index`: the printed sleeve and
+    /// the disc in it.
+    fn request_case_art(&self, index: usize) {
+        let Some(game) = self.games.get(index) else {
+            return;
+        };
+        let art = case_art::CaseArt {
+            title: game.title.clone(),
+            front: game.cover.clone(),
+            back: self.backs.get(index).cloned().flatten(),
+            spine: self.spines.get(index).cloned().flatten(),
+            disc: self.disc_label(game),
+            discs: game.discs.len().max(1),
+        };
+        let tx = self.slot_tx.clone();
+        let key = format!("case:{index}");
+        std::thread::spawn(move || {
+            // The preview shows the sleeve alone: no disc, so no disc art.
+            let wrap = case_art::wrap(&art);
+            let _ = tx.send((fz1_3d::ArtSlot::Wrap, key, wrap.as_raw().to_vec()));
+        });
+    }
+
+    /// Hand finished artwork to the renderer, if it is still what is wanted.
+    fn take_slot_art(&mut self, state: &eframe::egui_wgpu::RenderState) {
+        while let Ok((slot, key, rgba)) = self.slot_rx.try_recv() {
+            let wanted = match slot {
+                fz1_3d::ArtSlot::Platter => self
+                    .fz1_disc_art
+                    .as_ref()
+                    .is_some_and(|p| p.to_string_lossy() == key),
+                _ => self.case_art_for.is_some_and(|i| key == format!("case:{i}")),
+            };
+            if !wanted {
+                continue;
+            }
+            if let Some(r) = self.fz1.as_mut() {
+                r.set_art(state, slot, &rgba);
+                if slot == fz1_3d::ArtSlot::Platter {
+                    self.fz1_disc_uploaded = self.fz1_disc_art.clone();
+                }
+            }
+        }
+    }
+
+    /// Open a game's case in the upper view.
+    fn open_case(&mut self, index: usize) {
+        if self.games.get(index).is_none() {
             return;
         }
-        // Slot 0 is an empty tray: nothing chosen, which is where the
-        // machine starts.
-        let count = self.games.len() + 1;
-        self.selected = self.selected.min(count - 1);
-        let room = ui.available_width();
-        let mut shown = 7usize.min(count);
-        while shown > 1 && (TILE_W + 6.0) * shown as f32 > room {
-            shown -= 2;
+        self.selected = Some(index);
+        if self.case_open != Some(index) {
+            self.fz1_state.case_yaw = 0.35;
+            self.fz1_state.case_pitch = 0.12;
+            self.fz1_state.case_zoom = 1.0;
         }
-        let half = (shown / 2) as isize;
-        let width = TILE_W;
-        let row_w = (width + 6.0) * shown as f32;
-        let margin = ((room - row_w) * 0.5).max(0.0);
-        ui.horizontal(|ui| {
-            ui.add_space(margin);
-            for slot in -half..=half {
-                let index = (self.selected as isize + slot).rem_euclid(count as isize) as usize;
-                let middle = slot == 0;
-                let path = index
-                    .checked_sub(1)
-                    .and_then(|g| self.games.get(g))
-                    .and_then(|g| self.media_for(g, "marquee"));
-                let tex = path.and_then(|p| self.art_texture(p.as_path()));
-                let size = egui::vec2(width, if middle { height } else { height * 0.82 });
-                let (rect, press) = ui.allocate_exact_size(size, egui::Sense::click());
-                let painter = ui.painter();
-                painter.rect_filled(rect, 4.0, if middle { CARD } else { PANEL });
-                if let Some(id) = tex {
-                    painter.image(
-                        id,
-                        rect.shrink(2.0),
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                } else {
-                    let label = match index.checked_sub(1).and_then(|g| self.games.get(g)) {
-                        Some(game) => game.title.clone(),
-                        None => "no disc".to_string(),
-                    };
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(11.0),
-                        TEXT_DIM,
-                    );
+        self.case_open = Some(index);
+    }
+
+    /// Start putting `index` in the machine: the drawer runs out, whatever is
+    /// in it comes out, the new disc goes down, the drawer shuts, the platter
+    /// spins up and the machine comes on. The same path whether the machine
+    /// is empty or a game is already running in it.
+    fn start_load(&mut self, index: usize) {
+        if self.games.get(index).is_none() || self.closing.is_some() {
+            return;
+        }
+        self.selected = Some(index);
+        self.case_open = None;
+        self.frontend = false;
+        // Whatever is running stops now; its disc comes out with the drawer.
+        if self.emu.running() {
+            self.emu.set_paused(false);
+            self.emu.stop();
+            self.save_nvram();
+        }
+        if self.emu.disc_loaded() {
+            self.emu.eject_disc();
+        }
+        self.picture_live = false;
+        self.fz1_tray_open = true;
+        self.load = Some(Load {
+            game: index,
+            step: LoadStep::Eject,
+            t: 0.0,
+        });
+        // Get the new disc's picture decoding while the drawer runs out.
+        if let Some(art) = self.platter_art(index) {
+            if self.game.is_none() && self.fz1_disc_art.as_ref() != Some(&art) {
+                self.fz1_disc_art = Some(art.clone());
+                self.request_platter(art);
+            }
+        }
+    }
+
+    /// The machine's own OPEN/CLOSE. Shutting an empty drawer is just that;
+    /// opening it is a real eject, and so is pressing it while a load is
+    /// still playing - in both cases the disc leaves the drive, so nothing
+    /// is left booting or running from a disc that has come out.
+    fn toggle_tray(&mut self) {
+        if self.load.is_none() && self.fz1_tray_open {
+            self.fz1_tray_open = false;
+            // A disc was still waiting on the drawer and nothing is in the
+            // drive: shutting it is the user taking that disc away.
+            if !self.emu.disc_loaded() {
+                self.clear_tray_disc();
+            }
+        } else {
+            self.eject();
+        }
+    }
+
+    /// Take the disc out, whatever stage the machine had reached. A load
+    /// still running is cancelled; a game still running is stopped and saved
+    /// and the launcher comes back. The spindle loses power, so the disc
+    /// coasts down, and the drawer runs out with the disc still on it: it
+    /// waits there to be swapped for another, or to be taken away by
+    /// shutting the drawer on nothing.
+    fn eject(&mut self) {
+        let cancelled = self.load.take().is_some();
+        if self.emu.running() {
+            self.emu.set_paused(false);
+            self.emu.stop();
+            self.save_nvram();
+        }
+        if self.emu.disc_loaded() {
+            self.emu.eject_disc();
+        }
+        self.picture_live = false;
+        self.frontend = false;
+        self.disc_index = 0;
+        // `self.game` and its platter picture are left alone: the disc is
+        // out of the drive but still on the drawer, and the scene has to go
+        // on showing it sitting there.
+        if self.game.is_some() {
+            self.fz1_state.disc_drop = 1.0;
+        }
+        self.fz1_tray_open = true;
+        self.view = View::Machine;
+        self.status = if cancelled {
+            "load cancelled - the disc came out".to_string()
+        } else if self.game.is_some() {
+            "ejected - the disc is waiting on the drawer".to_string()
+        } else {
+            String::new()
+        };
+    }
+
+    /// Lift the ejected disc off the open drawer: what is left is an empty
+    /// machine with an empty tray.
+    fn clear_tray_disc(&mut self) {
+        self.game = None;
+        self.disc_index = 0;
+        self.fz1_disc_art = None;
+        self.fz1_state.disc_drop = 0.0;
+    }
+
+    /// Skip whatever is left of the load: straight to the machine on.
+    fn finish_load(&mut self) {
+        let Some(load) = self.load.take() else {
+            return;
+        };
+        self.fz1_tray_open = false;
+        self.fz1_state.tray = 0.0;
+        self.fz1_state.disc_drop = 1.0;
+        self.insert_disc(load.game);
+        if !self.emu.running() {
+            self.power_on();
+        }
+    }
+
+    /// Step the load along. The drawer moves on its own clock in
+    /// `animate`; each step waits for it.
+    fn advance_load(&mut self, dt: f32) {
+        let Some(load) = self.load.as_mut() else {
+            return;
+        };
+        load.t += dt;
+        let tray = self.fz1_state.tray;
+        match load.step {
+            LoadStep::Eject => {
+                if tray < 0.999 {
+                    load.t = 0.0;
+                    return;
                 }
-                painter.rect_stroke(
-                    rect,
-                    4.0,
-                    egui::Stroke::new(
-                        if middle { 2.0 } else { 1.0 },
-                        if middle {
-                            egui::Color32::WHITE
-                        } else if press.hovered() {
-                            TEXT_DIM
-                        } else {
-                            PANEL
-                        },
-                    ),
-                    StrokeKind::Inside,
-                );
-                if press.clicked() && self.fz1_tray_open {
-                    // A neighbour walks the shelf; the middle tile is the
-                    // chosen one already, so its click opens the art instead.
-                    if middle && self.selected_game().is_some() {
-                        self.art_zoom = true;
-                    } else {
-                        self.selected = index;
+                // The old disc lifts off the platter, then is gone.
+                if self.game.is_some() {
+                    self.fz1_state.disc_drop = (1.0 - load.t / 0.8).max(0.0);
+                    if self.fz1_state.disc_drop > 0.0 {
+                        return;
+                    }
+                    self.game = None;
+                }
+                let game = load.game;
+                load.step = LoadStep::Place;
+                load.t = 0.0;
+                self.fz1_state.disc_drop = 0.0;
+                if let Some(art) = self.platter_art(game) {
+                    if self.fz1_disc_art.as_ref() != Some(&art) {
+                        self.fz1_disc_art = Some(art.clone());
+                        self.request_platter(art);
                     }
                 }
             }
-        });
-        // The arrow keys walk the row. Nothing else moves it — a stray
-        // wheel event anywhere else in the window must not spin the shelf.
-        let step = if self.fz1_tray_open {
-            ui.ctx().input(|i| {
-                i.key_pressed(egui::Key::ArrowRight) as i32
-                    - i.key_pressed(egui::Key::ArrowLeft) as i32
-            })
-        } else {
-            0
-        };
-        if step != 0 {
-            self.selected =
-                (self.selected as isize + step as isize).rem_euclid(count as isize) as usize;
-        }
-    }
-
-    /// Work the drawer. Shutting it on a chosen disc loads that disc, the
-    /// way the machine does; powering on is still the user's to press.
-    /// The game the selector is on, if it is on one at all: slot 0 is an
-    /// empty tray.
-    fn selected_game(&self) -> Option<usize> {
-        self.selected.checked_sub(1)
-    }
-
-    fn toggle_tray(&mut self) {
-        self.fz1_tray_open = !self.fz1_tray_open;
-        if !self.fz1_tray_open {
-            // Shutting the drawer on a chosen disc loads it.
-            self.pending_start = self.selected_game();
-        }
-        // Opening the drawer cuts the spindle: the disc coasts down and
-        // stays stopped while the drawer is out.
-    }
-
-    /// Drive the start the drawer is holding up, once it has closed.
-    fn advance_start(&mut self) {
-        if self.fz1_state.tray > 0.02 {
-            return;
-        }
-        if let Some(index) = self.pending_start.take() {
-            self.insert_disc(index);
-            // Shutting the drawer on a disc starts it: a machine that was
-            // off comes on by itself rather than waiting to be noticed.
-            if !self.emu.running() {
-                self.power_on();
+            LoadStep::Place => {
+                // The disc only comes down once its picture is on it.
+                if self.fz1_disc_uploaded != self.fz1_disc_art {
+                    load.t = 0.0;
+                    return;
+                }
+                let e = (load.t / 1.1).min(1.0);
+                self.fz1_state.disc_drop = e;
+                if e >= 1.0 && load.t > 1.4 {
+                    load.step = LoadStep::Close;
+                    load.t = 0.0;
+                    self.fz1_tray_open = false;
+                }
+            }
+            LoadStep::Close => {
+                if tray <= 0.001 {
+                    load.step = LoadStep::SpinUp;
+                    load.t = 0.0;
+                }
+            }
+            LoadStep::SpinUp => {
+                if load.t >= SPINUP_SECS {
+                    self.finish_load();
+                }
             }
         }
     }
 
-    /// Paint the FZ-1 model into `rect`, returning whether it drew. The model
-    /// loads on first use and the renderer is built from egui's own wgpu
-    /// device, so it shares the window's surface. `fade` below 1.0 is the
-    /// console leaving as the game takes over: it sinks and goes see-through,
-    /// and its controls stop answering.
-    fn draw_fz1(
-        &mut self,
-        ui: &mut egui::Ui,
-        frame: &mut eframe::Frame,
-        rect: egui::Rect,
-        fade: f32,
-    ) -> bool {
+    /// The disc the platter carries this frame, if any.
+    fn platter_game(&self) -> Option<usize> {
+        match &self.load {
+            Some(l) if l.step == LoadStep::Eject => self.game,
+            Some(l) => Some(l.game),
+            None => platter_title(
+                self.game,
+                self.emu.disc_loaded(),
+                self.disc_speed > 0.01,
+                self.fz1_tray_open,
+            ),
+        }
+    }
+
+    /// Move the scene on by `dt`: the drawer, the disc, the lamps, the
+    /// unboxing. Runs only while the launcher is on screen.
+    fn animate(&mut self, dt: f32, time: f64) {
+        let running = self.emu.running();
+        // A machine still in its carton keeps its drawer shut: nothing opens
+        // until it is out and standing on the table.
+        let boxed = self.fz1_state.unbox < 0.999;
+        self.fz1_state.tray_goal = if self.fz1_tray_open && !boxed { 1.0 } else { 0.0 };
+        let step = dt * TRAY_RATE;
+        let gap = self.fz1_state.tray_goal - self.fz1_state.tray;
+        self.fz1_state.tray += gap.clamp(-step, step);
+        let platter = self.platter_game();
+        self.fz1_state.disc_shown = platter.is_some();
+        if self.load.is_none() {
+            self.fz1_state.disc_drop = if platter.is_some() { 1.0 } else { 0.0 };
+        }
+        self.fz1_state.spin = self.disc_angle;
+        self.fz1_state.lit = running;
+        // The ACCESS lamp only ever shows the drive at work: spinning up,
+        // the BIOS reading the disc, the drawer running.
+        let spinning_up = self.load.as_ref().is_some_and(|l| l.step == LoadStep::SpinUp);
+        let booting = running && !self.picture_live;
+        let drawer = (self.fz1_state.tray - self.fz1_state.tray_goal).abs() > 0.001;
+        self.fz1_state.access = if spinning_up || booting || (running && drawer) {
+            ((time * 5.0).fract() < 0.6) as u8 as f32
+        } else {
+            0.0
+        };
+        // The unboxing, and the box-away once the drawer is shut.
+        if let Some(c) = self.closing.as_mut() {
+            if self.fz1_state.tray <= 0.001 {
+                *c = (*c + dt / BOXAWAY_SECS).min(1.0);
+            }
+            self.fz1_state.unbox = 1.0 - *c;
+        } else {
+            let was = self.intro;
+            self.intro = (self.intro + dt / INTRO_SECS).min(1.0);
+            if was < 1.0 && self.intro >= 1.0 {
+                self.intro_done();
+            }
+            // The show is the spin and then the unboxing, back to back.
+            self.fz1_state.unbox = ((self.intro - SPIN_FRAC) / (1.0 - SPIN_FRAC)).clamp(0.0, 1.0);
+            if !self.spun {
+                let s = (self.intro / SPIN_FRAC).clamp(0.0, 1.0);
+                // Eased at both ends, and a whole turn, so it lands on the
+                // three-quarter view it started from.
+                self.fz1_state.yaw = YAW0 + smoothstep(s) * std::f32::consts::TAU;
+                self.spun = s >= 1.0;
+            }
+        }
+        self.fz1_state.zoom = self.fz1_user_zoom.clamp(0.45, 3.0);
+    }
+
+    /// Out of the box: an empty machine opens its drawer for a disc.
+    fn intro_done(&mut self) {
+        if self.game.is_none() && self.load.is_none() {
+            self.fz1_tray_open = true;
+        }
+    }
+
+    /// Load the scene and build the renderer, once, from egui's own wgpu
+    /// device. Returns false where there is no GPU path or no model.
+    fn ensure_scene(&mut self, frame: &mut eframe::Frame) -> bool {
         if !self.fz1_tried {
             self.fz1_tried = true;
-            if let Some(console) = fz1_3d::load_model() {
-                self.fz1_scene.push(console);
+            let console = fz1_3d::load_model();
+            let carton = fz1_3d::load_carton();
+            let case = fz1_3d::load_case();
+            if let (Some(a), Some(b), Some(c)) = (console, carton, case) {
+                self.fz1_scene = vec![a, b, c];
             }
         }
         if self.fz1_scene.is_empty() {
@@ -1881,94 +2557,63 @@ impl GuiApp {
         };
         if self.fz1.is_none() {
             self.fz1 = fz1_3d::Fz1Renderer::new(state, &self.fz1_scene);
-        }
-
-        // The disc wears the disc's own label art, not the box cover, and
-        // falls back to whatever the gallery has if a title has no label.
-        let art = match self.view {
-            View::Setup => None,
-            View::Machine => {
-                // The platter wears the disc that is actually in the drive.
-                // The shelf's selection is a choice, not an insertion: on a
-                // fresh launch nothing is in the machine, so the platter is
-                // bare even with a title highlighted.
-                let game = platter_title(
-                    self.game,
-                    self.emu.disc_loaded(),
-                    self.disc_speed > 0.01,
-                )
-                .and_then(|g| self.games.get(g));
-                game.and_then(|g| self.disc_label(g))
-                    .or_else(|| game.and_then(|g| g.cover.clone()))
+            // A fresh renderer has empty slots: everything is asked again.
+            self.fz1_disc_uploaded = None;
+            self.case_art_for = None;
+            if let Some(art) = self.fz1_disc_art.clone() {
+                self.request_platter(art);
             }
+        }
+        self.take_slot_art(state);
+        self.fz1.is_some()
+    }
+
+    /// Let the 3D layer go entirely: a running game gets the GPU to itself.
+    fn suspend_scene(&mut self, frame: &mut eframe::Frame) {
+        if let Some(mut r) = self.fz1.take() {
+            if let Some(state) = frame.wgpu_render_state() {
+                r.release(state);
+            }
+        }
+        // Drop any artwork still on its way; it is asked again on return.
+        while self.slot_rx.try_recv().is_ok() {}
+    }
+
+    /// Paint the machine into `rect`, returning whether it drew. `fade`
+    /// below 1.0 is the machine leaving as the game takes over: it sinks
+    /// and goes see-through, and its controls stop answering.
+    fn draw_fz1(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &mut eframe::Frame,
+        rect: egui::Rect,
+        fade: f32,
+    ) -> bool {
+        if !self.ensure_scene(frame) {
+            return false;
+        }
+        let Some(state) = frame.wgpu_render_state() else {
+            return false;
         };
+        // The platter picture follows the disc on it.
+        if self.load.is_none() {
+            let want = self.platter_game().and_then(|g| self.platter_art(g));
+            if want.is_some() && want != self.fz1_disc_art {
+                self.fz1_disc_art = want.clone();
+                if let Some(art) = want {
+                    self.request_platter(art);
+                }
+            }
+        }
         let Some(renderer) = self.fz1.as_mut() else {
             return false;
         };
-        if art != self.fz1_disc_art || !self.fz1_disc_set {
-            self.fz1_disc_art = art.clone();
-            self.fz1_disc_set = true;
-            if art.is_none() {
-                // Nothing chosen: a blank platter in the drawer's own colour,
-                // rather than the tray showing through where a disc goes.
-                let size = fz1_3d::Fz1Renderer::ART_SIZE;
-                let blank: Vec<u8> = std::iter::repeat_n([38u8, 38, 43, 255], (size * size) as usize)
-                    .flatten()
-                    .collect();
-                renderer.set_disc_art(state, &blank, size, size);
-            }
-            if let Some(image) = art.as_ref().and_then(|p| image::open(p).ok()) {
-                // Square, at exactly the disc texture's size, so the label
-                // covers the disc instead of a corner of it.
-                let size = fz1_3d::Fz1Renderer::ART_SIZE;
-                let image = image
-                    .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
-                    .to_rgba8();
-                renderer.set_disc_art(state, image.as_raw(), size, size);
-            }
-        }
-
-        // The drawer follows the open/close button, and shuts itself when the
-        // machine runs. The disc turns on the same angle the drawn console
-        // uses.
-        let running = self.emu.running();
-        self.fz1_state.tray_goal = if self.fz1_tray_open { 1.0 } else { 0.0 };
-        let step = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1) * 2.0;
-        let gap = self.fz1_state.tray_goal - self.fz1_state.tray;
-        self.fz1_state.tray += gap.clamp(-step, step);
-
-        // The eye comes in as the drawer opens and backs off as it shuts:
-        // about 0.4 s each way, smoothstepped so it eases at both ends.
-        // `zoom` is a distance multiplier, so in is below 1.0.
-        let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
-        let zoom_goal = if self.fz1_tray_open { 1.0 } else { 0.0 };
-        self.drawer_zoom += (zoom_goal - self.drawer_zoom).clamp(-dt / 0.4, dt / 0.4);
-        let e = self.drawer_zoom * self.drawer_zoom * (3.0 - 2.0 * self.drawer_zoom);
-        self.fz1_state.zoom = (self.fz1_user_zoom * (1.0 - 0.38 * e)).clamp(0.45, 3.0);
-        self.fz1_state.spin = self.disc_angle;
-        let turn = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
-        if self.console_spin {
-            self.fz1_state.yaw += turn * 0.7;
-        } else if self.auto_spin {
-            self.fz1_state.yaw += turn * 0.3;
-        }
-        self.fz1_state.lit = running;
-        // The ACCESS lamp only ever shows disc access: it blinks while the
-        // BIOS is still coming up and again while the drawer runs out.
-        let booting = running && !self.picture_live;
-        let ejecting =
-            running && self.fz1_state.tray_goal > 0.5 && self.fz1_state.tray < 0.98;
-        let t = ui.ctx().input(|i| i.time);
-        self.fz1_state.access = if booting || ejecting {
-            ((t * 5.0).fract() < 0.6) as u8 as f32
-        } else {
-            0.0
-        };
-
         let ppt = ui.ctx().pixels_per_point();
         let w = (rect.width() * ppt).round().max(1.0) as u32;
         let h = (rect.height() * ppt).round().max(1.0) as u32;
-        let Some(tex) = renderer.render_into(state, &self.fz1_scene, &self.fz1_state, (w, h), 0, 0..1)
+        let boxed = self.fz1_state.unbox < 0.999;
+        let which = if boxed { 0..2 } else { 0..1 };
+        let Some(tex) = renderer.render_into(state, &self.fz1_scene, &self.fz1_state, (w, h), 0, which)
         else {
             return false;
         };
@@ -1979,41 +2624,58 @@ impl GuiApp {
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE.gamma_multiply(fade.clamp(0.0, 1.0)),
         );
+        ui.ctx().request_repaint();
         if fade < 0.999 {
-            // Leaving or arriving: the machine is scenery, not a control.
-            ui.ctx().request_repaint();
             return true;
         }
 
-        // Turn it with a drag, come closer with the wheel.
-        let turn = ui.interact(
-            rect,
-            ui.id().with("fz1-orbit"),
-            egui::Sense::click_and_drag(),
-        );
-        if turn.dragged() {
-            let drag = turn.drag_delta();
+        let scene = ui.interact(rect, ui.id().with("fz1-orbit"), egui::Sense::click_and_drag());
+        // The unboxing and the load are shows; a click skips them.
+        if boxed || self.load.is_some() {
+            if scene.clicked() {
+                if self.closing.is_none() && boxed {
+                    self.intro = 1.0;
+                    self.fz1_state.unbox = 1.0;
+                    self.fz1_state.yaw = YAW0;
+                    self.spun = true;
+                    self.intro_done();
+                } else if self.load.is_some() {
+                    self.finish_load();
+                }
+            }
+            if self.load.is_some() {
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.max.y - 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    "click to skip",
+                    egui::FontId::proportional(11.0),
+                    TEXT_DIM,
+                );
+            }
+            return true;
+        }
+
+        // Turn it with a drag, come closer with the wheel. Nothing turns it
+        // but a hand.
+        if scene.dragged() {
+            let drag = scene.drag_delta();
             self.fz1_state.yaw += drag.x * 0.01;
             self.fz1_state.pitch = (self.fz1_state.pitch - drag.y * 0.01).clamp(-1.2, 1.2);
-            // Taking hold of the machine ends the launch turn for good.
-            self.auto_spin = false;
+            self.orbit_hint = self.orbit_hint.min(0.99);
         }
-        if turn.hovered() {
+        if scene.hovered() {
             let wheel = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if wheel != 0.0 {
-                self.fz1_user_zoom =
-                    (self.fz1_user_zoom * (1.0 - wheel * 0.002)).clamp(0.45, 3.0);
+                self.fz1_user_zoom = (self.fz1_user_zoom * (1.0 - wheel * 0.002)).clamp(0.45, 3.0);
             }
         }
 
-        // The model's own buttons, wherever they have turned to: each part is
-        // projected to the picture, and the ones that are controls get a hit
-        // target there.
+        // The model's own buttons, wherever they have turned to.
         let mut hit: Option<&'static str> = None;
-        for (name, at, depth) in renderer.screen_points() {
+        for (index, (name, at, depth)) in renderer.screen_points().iter().enumerate() {
             let control = match name.as_str() {
-                n if n.contains("Power") => "power",
-                n if n.contains("Eject") || n.contains("Open") => "tray",
+                "PowerButton" => "power",
+                "OpenCloseButton" => "tray",
                 _ => continue,
             };
             if *depth < 0.0 || *depth > 1.0 {
@@ -2025,51 +2687,267 @@ impl GuiApp {
             );
             let size = (rect.width() * 0.05).clamp(14.0, 40.0);
             let spot = egui::Rect::from_center_size(centre, egui::vec2(size, size));
-            let press = ui.interact(spot, ui.id().with(("fz1", control)), egui::Sense::click());
+            // A button is several parts, so each one needs its own id.
+            let press = ui.interact(spot, ui.id().with(("fz1", control, index)), egui::Sense::click());
             if press.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 ui.painter()
                     .circle_stroke(centre, size * 0.5, egui::Stroke::new(1.5, ACCENTS[3]));
             }
-            // Only a deliberate press on the part being pointed at: a click
-            // buffered from focusing the window must not eject the disc.
             if press.hovered() && press.clicked_by(egui::PointerButton::Primary) {
                 hit = Some(control);
             }
         }
-        if let Some(control) = hit {
-            match (control, self.emu.running()) {
-                ("power", false) => self.power_on(),
-                ("power", true) => self.power_off(),
-                // The machine's own open/close button works the drawer both
-                // ways; EJECT is what gives the disc back.
-                ("tray", _) => self.toggle_tray(),
-                _ => {}
-            }
+        match (hit, self.emu.running()) {
+            (Some("power"), false) => self.power_on(),
+            (Some("power"), true) => self.power_off(),
+            (Some("tray"), _) => self.toggle_tray(),
+            _ => {}
         }
 
-        // The orbit hint: a few seconds once the machine is on screen, or
-        // until the first drag shows it was not needed, then it fades and
-        // does not come back.
+        let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
         if self.orbit_hint > 0.0 {
             self.orbit_seen += dt;
-            if self.orbit_seen > 6.0 || !self.auto_spin {
+            if self.orbit_seen > 6.0 || self.orbit_hint < 1.0 {
                 self.orbit_hint = (self.orbit_hint - dt / 1.2).max(0.0);
             }
-            if self.orbit_hint > 0.0 {
-                ui.painter().text(
-                    egui::pos2(rect.center().x, rect.max.y - 34.0),
-                    egui::Align2::CENTER_CENTER,
-                    "drag to rotate · wheel to zoom",
-                    egui::FontId::proportional(11.0),
-                    TEXT_DIM.gamma_multiply(self.orbit_hint),
-                );
+            ui.painter().text(
+                egui::pos2(rect.center().x, rect.max.y - 16.0),
+                egui::Align2::CENTER_CENTER,
+                "drag to turn · wheel to zoom · OPEN/CLOSE and POWER work",
+                egui::FontId::proportional(11.0),
+                TEXT_DIM.gamma_multiply(self.orbit_hint),
+            );
+        }
+        true
+    }
+
+    /// The case of `index` in the upper view: turn it by hand to read the
+    /// back, and put its disc in from here.
+    fn view_case(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame, rect: egui::Rect, index: usize) {
+        if !self.ensure_scene(frame) {
+            self.case_open = None;
+            return;
+        }
+        if self.case_art_for != Some(index) {
+            self.case_art_for = Some(index);
+            self.request_case_art(index);
+        }
+        let (Some(state), Some(renderer)) = (frame.wgpu_render_state(), self.fz1.as_mut()) else {
+            return;
+        };
+        let ppt = ui.ctx().pixels_per_point();
+        let w = (rect.width() * ppt).round().max(1.0) as u32;
+        let h = (rect.height() * ppt).round().max(1.0) as u32;
+        if let Some(tex) = renderer.render_into(state, &self.fz1_scene, &self.fz1_state, (w, h), 1, 2..3) {
+            ui.painter().image(
+                tex,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        let orbit = ui.interact(rect, ui.id().with("case-orbit"), egui::Sense::click_and_drag());
+        if orbit.dragged() {
+            let d = orbit.drag_delta();
+            self.fz1_state.case_yaw += d.x * 0.01;
+            self.fz1_state.case_pitch = (self.fz1_state.case_pitch - d.y * 0.01).clamp(-1.4, 1.4);
+        }
+        if orbit.hovered() {
+            let wheel = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+            if wheel != 0.0 {
+                self.fz1_state.case_zoom =
+                    (self.fz1_state.case_zoom * (1.0 - wheel * 0.002)).clamp(0.5, 2.5);
             }
         }
-
-        self.spin_handle(ui, rect);
+        let title = self
+            .games
+            .get(index)
+            .map(|g| case_art::clean_title(&g.title))
+            .unwrap_or_default();
+        // The case fills the view, so the caption needs its own ground.
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.min.y),
+                egui::pos2(rect.max.x, rect.min.y + 52.0),
+            ),
+            0.0,
+            egui::Color32::from_black_alpha(150),
+        );
+        ui.painter().text(
+            egui::pos2(rect.center().x, rect.min.y + 18.0),
+            egui::Align2::CENTER_CENTER,
+            &title,
+            egui::FontId::proportional(18.0),
+            egui::Color32::from_rgb(220, 222, 230),
+        );
+        ui.painter().text(
+            egui::pos2(rect.center().x, rect.min.y + 40.0),
+            egui::Align2::CENTER_CENTER,
+            "drag to turn it over · wheel to zoom",
+            egui::FontId::proportional(11.0),
+            TEXT_DIM,
+        );
+        let bar = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.max.y - 26.0),
+            egui::vec2(300.0, 34.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            ui.horizontal_centered(|ui| {
+                let insert = egui::Button::new(egui::RichText::new("▶  Insert disc").size(15.0))
+                    .fill(egui::Color32::from_rgb(40, 90, 60));
+                if ui.add(insert).clicked() {
+                    self.start_load(index);
+                }
+                if ui.button(egui::RichText::new("✕  Back").size(15.0)).clicked() {
+                    self.case_open = None;
+                }
+            });
+        });
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.case_open = None;
+        }
         ui.ctx().request_repaint();
-        true
+    }
+
+    /// The shelf: every game spine-out, side by side, in its own strip under
+    /// the machine. One click opens the case; a double click puts the disc
+    /// straight in.
+    fn view_shelf(&mut self, ui: &mut egui::Ui, strip: egui::Rect, alpha: f32) {
+        let painter = ui.painter_at(strip);
+        let back = egui::Color32::from_rgb(17, 17, 24).gamma_multiply(alpha);
+        painter.rect_filled(strip, 0.0, back);
+        let board = egui::Rect::from_min_max(egui::pos2(strip.min.x, strip.max.y - 16.0), strip.max);
+        painter.rect_filled(board, 0.0, egui::Color32::from_rgb(38, 36, 40).gamma_multiply(alpha));
+        painter.line_segment(
+            [board.left_top(), board.right_top()],
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha((40.0 * alpha) as u8)),
+        );
+        if self.games.is_empty() {
+            painter.text(
+                strip.center(),
+                egui::Align2::CENTER_CENTER,
+                "no discs in the library folder",
+                egui::FontId::proportional(13.0),
+                TEXT_DIM.gamma_multiply(alpha),
+            );
+            return;
+        }
+        // Room above the spines for a pulled-out one and the title it names.
+        let h = (strip.height() - 16.0 - 34.0).max(40.0);
+        // A scan's own aspect, eased wider: a true 14 mm spine reads fine
+        // on a shelf at arm's length, but a window is further away and the
+        // lettering is what suffers, so each spine shows a half again as
+        // wide — and never thinner than lettering can live in.
+        let w = (h * SPINE_ASPECT * 1.5).max(22.0);
+        let gap = 2.0;
+        let total = self.games.len() as f32 * (w + gap);
+        let room = strip.width() - 40.0;
+        let hover_any = ui.rect_contains_pointer(strip);
+        if total > room {
+            if hover_any {
+                let wheel = ui.ctx().input(|i| i.smooth_scroll_delta);
+                self.shelf_scroll -= wheel.x + wheel.y;
+            }
+            self.shelf_scroll = self.shelf_scroll.clamp(0.0, total - room);
+        } else {
+            self.shelf_scroll = 0.0;
+        }
+        let mut x = if total > room {
+            strip.min.x + 20.0 - self.shelf_scroll
+        } else {
+            strip.center().x - total * 0.5
+        };
+        let mut named: Option<(egui::Pos2, String)> = None;
+        let mut open: Option<usize> = None;
+        let mut load: Option<usize> = None;
+        // A compact shelf: at most twenty spines on show at once.
+        let mut shown = 0;
+        for index in 0..self.games.len() {
+            let slot = egui::Rect::from_min_size(egui::pos2(x, board.min.y - h), egui::vec2(w, h));
+            x += w + gap;
+            if slot.max.x < strip.min.x || slot.min.x > strip.max.x {
+                continue;
+            }
+            shown += 1;
+            if shown > SHELF_MAX_SPINES {
+                break;
+            }
+            let press = ui.interact(slot, ui.id().with(("spine", index)), egui::Sense::click());
+            let chosen = self.case_open == Some(index);
+            let lift = if press.hovered() || chosen { 10.0 } else { 0.0 };
+            let rect = slot.translate(egui::vec2(0.0, -lift));
+            let tex = self
+                .spines
+                .get(index)
+                .cloned()
+                .flatten()
+                .and_then(|p| self.art_texture(&p));
+            let painter = ui.painter_at(strip);
+            let tint = egui::Color32::WHITE.gamma_multiply(alpha);
+            match tex {
+                Some(id) => {
+                    painter.image(
+                        id,
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        tint,
+                    );
+                }
+                None => {
+                    let title = self.games.get(index).map(|g| g.title.clone()).unwrap_or_default();
+                    text_spine(&painter, rect, &title, alpha);
+                }
+            }
+            // A sliver of shade down each edge, so the spines read as
+            // separate boxes standing side by side.
+            painter.rect_stroke(
+                rect,
+                1.0,
+                egui::Stroke::new(1.0, egui::Color32::from_black_alpha((150.0 * alpha) as u8)),
+                StrokeKind::Inside,
+            );
+            if chosen || self.game == Some(index) {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(0.0, 3.0), egui::vec2(w, 3.0)),
+                    1.0,
+                    if chosen { ACCENTS[3] } else { ACCENTS[1] },
+                );
+            }
+            if press.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                let title = self
+                    .games
+                    .get(index)
+                    .map(|g| case_art::clean_title(&g.title))
+                    .unwrap_or_default();
+                named = Some((egui::pos2(rect.center().x, strip.min.y + 12.0), title));
+            }
+            if press.double_clicked() {
+                load = Some(index);
+            } else if press.clicked() {
+                open = Some(index);
+            }
+        }
+        if let Some((at, title)) = named {
+            let at = egui::pos2(at.x.clamp(strip.min.x + 120.0, strip.max.x - 120.0), at.y);
+            painter.text(
+                at,
+                egui::Align2::CENTER_CENTER,
+                title,
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(225, 226, 232),
+            );
+        }
+        // Mid-load or mid-unbox the shelf is scenery.
+        let busy = self.load.is_some() || self.closing.is_some() || self.intro < 1.0;
+        if !busy {
+            if let Some(i) = load {
+                self.start_load(i);
+            } else if let Some(i) = open {
+                self.open_case(i);
+            }
+        }
     }
 
     /// The built-in reading of the console's own art — it needs no pack and
@@ -2086,7 +2964,13 @@ impl GuiApp {
     // only exists inside update().
     fn upload_pending(&mut self, ctx: &egui::Context) {
         for (key, img) in self.pending_images.drain(..) {
-            let tex = ctx.load_texture(key.clone(), img, TextureOptions::LINEAR);
+            // Mipmapped: spines and covers are shown far smaller than their
+            // scans, and plain linear filtering shimmers there.
+            let opts = TextureOptions {
+                mipmap_mode: Some(egui::TextureFilter::Linear),
+                ..TextureOptions::LINEAR
+            };
+            let tex = ctx.load_texture(key.clone(), img, opts);
             self.covers.insert(key, tex);
         }
     }
@@ -2096,15 +2980,22 @@ impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         while let Ok((key, img)) = self.covers_rx.try_recv() {
-            if key == LOGO_KEY
-                && self.splash_until.is_none()
-                && self.launched.elapsed() < Duration::from_secs(4)
-                && self.cfg.boot.is_none()
-                && self.cfg.play.is_none()
-            {
-                self.splash_until = Some(Instant::now() + Duration::from_millis(1800));
-            }
             self.pending_images.push((key, img));
+        }
+        self.run_script(&ctx);
+        // Closing the window puts the machine back in its box first; asking
+        // again while it packs away closes at once.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_now {
+            if self.closing.is_none() && self.view == View::Machine && self.fz1_scene_ok(frame) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.begin_close();
+            } else {
+                self.save_nvram();
+            }
+        }
+        if self.closing.is_some_and(|c| c >= 1.0) && !self.close_now {
+            self.close_now = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.upload_pending(&ctx);
         self.push_pads(&ctx);
@@ -2118,7 +3009,10 @@ impl eframe::App for GuiApp {
         let running = self.emu.running();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         if self.console_fade > 0.001 {
-            let target = if !self.emu.disc_loaded() || self.fz1_tray_open {
+            let spin_up = self.load.as_ref().is_some_and(|l| l.step == LoadStep::SpinUp);
+            let target = if spin_up {
+                9.0
+            } else if !self.emu.disc_loaded() || self.fz1_tray_open {
                 0.0
             } else if running {
                 9.0
@@ -2126,7 +3020,7 @@ impl eframe::App for GuiApp {
                 0.6
             };
             // Power off is quick; a real drive takes its time to come up.
-            let rate = if target < self.disc_speed { 12.0 } else { 4.0 };
+            let rate = if target < self.disc_speed { 4.0 } else { 1.6 };
             self.disc_speed += (target - self.disc_speed).clamp(-dt * rate, dt * rate);
             self.disc_angle += dt * self.disc_speed;
             if self.disc_speed > 0.01 {
@@ -2134,13 +3028,16 @@ impl eframe::App for GuiApp {
             }
             // Spindle stopped and nothing in the drive: the disc is off the
             // platter. A guest asking for the next disc of a set keeps the
-            // title, so the swap still knows what to put in.
+            // title, so the swap still knows what to put in, and so does a
+            // disc the launcher has ejected onto the open drawer.
             if self.game.is_some()
+                && self.load.is_none()
                 && self.disc_speed <= 0.01
                 && !self.emu.disc_loaded()
                 && !self.emu.disc_tray_open()
+                && !self.fz1_tray_open
             {
-                self.game = None;
+                self.clear_tray_disc();
             }
         }
         // A game asking for the next disc ejects the tray; answer it.
@@ -2168,81 +3065,44 @@ impl eframe::App for GuiApp {
         // The drawer being open is what "choosing a game" means: the
         // selector and the machine are on show then, and the picture has the
         // window to itself once it closes.
-        self.advance_start();
-        // A header the whole time: the emulator's name, and what is in the
-        // machine.
-        egui::Panel::top("header").exact_size(44.0).show(ui, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
-                ui.label(
-                    egui::RichText::new("RETRO 3DO")
-                        .strong()
-                        .size(18.0)
-                        .color(egui::Color32::from_rgb(210, 212, 220)),
-                );
-                let title = self
-                    .games
-                    .get(self.selected.saturating_sub(1))
-                    .map(|g| g.title.clone())
-                    .unwrap_or_default();
-                let discs = self
-                    .selected_game()
-                    .and_then(|g| self.games.get(g))
-                    .map_or(1, |g| g.discs.len());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(14.0);
-                    ui.label(
-                        egui::RichText::new(if discs > 1 {
-                            format!("{title}  ·  {discs} discs")
-                        } else {
-                            title
-                        })
-                        .color(TEXT_DIM),
-                    );
-                });
-            });
-        });
-        if self.art_zoom {
-            self.art_overlay(&ctx);
+        // The launcher's scene only moves while it is on screen; a running
+        // game suspends all of it.
+        if !self.game_live() {
+            let time = ctx.input(|i| i.time);
+            self.animate(dt, time);
+            self.advance_load(dt);
         }
-
-        let pads = self.pad_names();
-        if !self.status.is_empty() || !pads.is_empty() {
+        // No chrome strip at all: the window decorations carry the name, and
+        // the hamburger and the cog float over whatever is on screen.
+        // The status line carries messages only: a pad being plugged in is
+        // not news the player needs on screen.
+        if !self.status.is_empty() {
             egui::Panel::bottom("status").show(ui, |ui| {
-                if !self.status.is_empty() {
-                    ui.label(egui::RichText::new(&self.status).small().color(TEXT_DIM));
-                }
-                for name in pads {
-                    ui.label(
-                        egui::RichText::new(format!("pad connected: {name}")).small().color(TEXT_DIM),
-                    );
-                }
+                ui.label(egui::RichText::new(&self.status).small().color(TEXT_DIM));
             });
         }
 
         egui::CentralPanel::default().show(ui, |ui| match self.view {
             View::Setup => self.view_setup(ui),
             View::Machine => self.view_picture(ui, &ctx, frame),
+            View::Settings => self.view_settings(ui),
         });
+
+        // Escape is the way back off the settings page, as it is everywhere.
+        if self.view == View::Settings
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.close_settings();
+        }
+
+        // The hamburger and the cog, side by side in the corner. While a game
+        // has the window they hide, and the next touch brings them back.
+        if self.view == View::Machine && self.chrome_shown(&ctx) {
+            self.chrome_icons(&ctx);
+        }
 
         if self.picker.is_some() {
             self.dir_picker_overlay(&ctx);
-        }
-        if let Some(until) = self.splash_until {
-            if Instant::now() < until {
-                egui::Area::new(egui::Id::new("boot-splash"))
-                    .order(egui::Order::Foreground)
-                    .show(&ctx, |ui| {
-                        let screen = ctx.content_rect();
-                        ui.painter()
-                            .rect_filled(screen, 0.0, egui::Color32::BLACK);
-                        self.paint_logo(ui, screen, 0.85);
-                    });
-                ctx.request_repaint();
-            } else {
-                self.splash_until = None;
-            }
         }
     }
 }
@@ -2290,8 +3150,7 @@ impl GuiApp {
                         > 90
                 });
         });
-        // Only set picture_live after the boot splash has cleared.
-        if lit && self.splash_until.is_none() {
+        if lit {
             self.picture_live = true;
         }
     }
@@ -2304,7 +3163,7 @@ impl GuiApp {
     /// is the choosing state: the machine and the selector take the window
     /// back until it shuts.
     fn view_picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let live = self.emu.running() && self.picture_live && !self.fz1_tray_open;
+        let live = self.game_live();
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
         let goal = if live { 0.0 } else { 1.0 };
         self.console_fade += (goal - self.console_fade).clamp(-dt / 0.5, dt / 0.5);
@@ -2313,7 +3172,12 @@ impl GuiApp {
             return;
         }
         self.view_screen(ui, ctx, frame);
-        if self.console_fade > 0.001 {
+        if self.console_fade <= 0.001 {
+            // The game has the window: the launcher's 3D layer is let go
+            // rather than drawn under the picture. The parsed models stay
+            // in hand, so coming back rebuilds it.
+            self.suspend_scene(frame);
+        } else {
             // Mid-crossing: the machine sinks away over the new picture.
             let area = ui.available_rect_before_wrap();
             ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
@@ -2323,20 +3187,62 @@ impl GuiApp {
         }
     }
 
-    /// The machine, filling the window at one size whatever is going on,
-    /// with the selector along the bottom while the drawer is out.
+    /// Whether a game has the window: running, drawing, and not set aside
+    /// for the launcher.
+    fn game_live(&self) -> bool {
+        self.emu.running()
+            && self.picture_live
+            && !self.frontend
+            && self.load.is_none()
+            && self.closing.is_none()
+    }
+
+    fn fz1_scene_ok(&mut self, frame: &mut eframe::Frame) -> bool {
+        frame.wgpu_render_state().is_some() && (!self.fz1_tried || !self.fz1_scene.is_empty())
+    }
+
+    /// Start packing the machine away: whatever runs stops and is saved,
+    /// the drawer shuts, and the box-away plays before the window goes.
+    fn begin_close(&mut self) {
+        if self.emu.running() {
+            self.emu.set_paused(false);
+            self.emu.stop();
+        }
+        self.save_nvram();
+        self.load = None;
+        self.case_open = None;
+        self.frontend = false;
+        self.fz1_tray_open = false;
+        self.intro = 1.0;
+        self.closing = Some(0.0);
+    }
+
+    /// The launcher: the machine in the upper view (or the case being
+    /// looked at), and the shelf in its own strip along the bottom.
     fn view_machine(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, BG);
         self.wallpaper(ui, area);
-        let tiles = if self.fz1_tray_open { TILE_H + 18.0 } else { 0.0 };
-        let scene = egui::Rect::from_min_max(
-            area.min,
-            egui::pos2(area.max.x, area.max.y - tiles),
-        );
-        self.view_attract(ui, frame, scene);
-        if self.fz1_tray_open {
-            self.selector_strip(ui, area, tiles);
+        // Tall enough that a spine's title reads from a sofa: the strip takes
+        // nearly half the view, and the machine above it frames a little
+        // tighter. Spine art is long and thin, so height is what buys the
+        // width the lettering needs.
+        // A fifth taller than it was: the spines read from a sofa.
+        let shelf_h = (area.height() * 0.528).clamp(360.0, 672.0).min(area.height() * 0.72);
+        let scene = egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, area.max.y - shelf_h));
+        let strip = egui::Rect::from_min_max(egui::pos2(area.min.x, area.max.y - shelf_h), area.max);
+        match self.case_open {
+            Some(index) => self.view_case(ui, frame, scene, index),
+            None => self.view_attract(ui, frame, scene),
+        }
+        // The shelf comes in as the machine settles out of its box, and
+        // goes as it is packed away.
+        let alpha = match self.closing {
+            Some(c) => 1.0 - (c * 4.0).min(1.0),
+            None => ((self.fz1_state.unbox - 0.8) / 0.2).clamp(0.0, 1.0),
+        };
+        if alpha > 0.0 {
+            self.view_shelf(ui, strip, alpha);
         }
     }
 
@@ -2379,30 +3285,7 @@ impl GuiApp {
         ui.ctx().request_repaint();
     }
 
-    /// The selector on its card along the bottom.
-    fn selector_strip(&mut self, ui: &mut egui::Ui, area: egui::Rect, tiles: f32) {
-        let strip = egui::Rect::from_min_max(
-            egui::pos2(area.min.x, area.max.y - tiles),
-            area.max,
-        );
-        ui.painter().rect(
-            strip.shrink2(egui::vec2(10.0, 4.0)),
-            8.0,
-            CARD,
-            egui::Stroke::new(1.0, PANEL),
-            StrokeKind::Inside,
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new().max_rect(strip.shrink2(egui::vec2(16.0, 10.0))),
-            |ui| {
-                self.game_selector(ui, TILE_H);
-            },
-        );
-    }
-
-    /// Nothing on the screen yet: the machine is the whole view, drawn to
-    /// fill the scene while keeping its shape, with only a quiet word on
-    /// what to press floated along the bottom.
+    /// The machine in the upper view, with a word on what to do next.
     fn view_attract(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame, scene: egui::Rect) {
         let drawn = ui
             .scope_builder(egui::UiBuilder::new().max_rect(scene), |ui| {
@@ -2410,21 +3293,58 @@ impl GuiApp {
             })
             .inner;
         if !drawn {
+            // No GPU path: no show to wait for.
+            self.intro = 1.0;
+            if self.load.is_some() {
+                self.finish_load();
+            }
+            if self.closing.is_some() {
+                self.closing = Some(1.0);
+            }
             ui.painter().rect_filled(scene, 6.0, PANEL);
         }
+        let hint = if self.closing.is_some() || self.intro < 1.0 || self.load.is_some() {
+            ""
+        } else if self.emu.running() && self.frontend {
+            "Esc returns to the game · double-click a spine to change discs"
+        } else {
+            "click a spine to look at the case · double-click to play it"
+        };
         ui.painter().text(
-            egui::pos2(scene.center().x, scene.max.y - 12.0),
+            egui::pos2(scene.center().x, scene.min.y + 14.0),
             egui::Align2::CENTER_CENTER,
-            if self.fz1_tray_open {
-                "pick a disc below, then shut the drawer"
-            } else {
-                "press OPEN/CLOSE on the machine to choose a disc"
-            },
+            hint,
             egui::FontId::proportional(12.0),
             TEXT_DIM,
         );
+        if self.emu.running() && self.frontend && self.load.is_none() {
+            let spot = egui::Rect::from_min_size(
+                egui::pos2(scene.max.x - 640.0, scene.min.y + 30.0),
+                egui::vec2(626.0, 30.0),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(spot), |ui| {
+                ui.horizontal(|ui| {
+                    let resume = ui.button("▶  Back to the game");
+                    if resume.clicked() || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.frontend = false;
+                        self.emu.set_paused(false);
+                    }
+                    if ui.button("⟲  Reset").clicked() {
+                        self.emu.request_reset();
+                    }
+                    if ui.button("⚙  Settings").clicked() {
+                        self.open_settings();
+                    }
+                    if ui.button("⏏  Eject").clicked() {
+                        self.eject();
+                    }
+                    if ui.button("✕  Power off").clicked() {
+                        self.power_off();
+                    }
+                });
+            });
+        }
     }
-
 
     /// The picture, once a game is drawing it.
     fn view_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -2442,9 +3362,6 @@ impl GuiApp {
                 egui::FontId::proportional(15.0),
                 TEXT_DIM,
             );
-            if !self.fz1_tray_open {
-                self.eject_corner(ui, rect);
-            }
             return;
         }
         // The newest field was already captured by `poll_frame` this repaint.
@@ -2481,7 +3398,8 @@ impl GuiApp {
                     h as u32,
                     out_w,
                     out_h,
-                    target_h == 0,
+                    // Crisp unless the player asked for the smooth filter.
+                    target_h == 0 && !self.cfg.smooth,
                     sharpen,
                 );
                 frame_size = egui::vec2(out_w as f32, out_h as f32);
@@ -2492,12 +3410,14 @@ impl GuiApp {
             // normal egui texture at native size, scaled by the backend.
             if let Some((w, h)) = dims {
                 let img = ColorImage::from_rgba_unmultiplied([w, h], &self.frame_rgba);
+                let opts = if self.cfg.smooth {
+                    TextureOptions::LINEAR
+                } else {
+                    TextureOptions::NEAREST
+                };
                 match &mut self.frame_tex {
-                    Some(tex) if tex.size() == img.size => tex.set(img, TextureOptions::NEAREST),
-                    _ => {
-                        self.frame_tex =
-                            Some(ctx.load_texture("frame", img, TextureOptions::NEAREST))
-                    }
+                    Some(tex) if tex.size() == img.size => tex.set(img, opts),
+                    _ => self.frame_tex = Some(ctx.load_texture("frame", img, opts)),
                 }
             }
             if let Some(tex) = &self.frame_tex {
@@ -2534,77 +3454,184 @@ impl GuiApp {
             self.paint_logo(ui, rect, 0.85);
         }
 
-        // Overlay chrome appears when the pointer moves near the top, and keys
-        // still work: Esc powers off to the console.
-        let pointer_y = ctx.input(|i| i.pointer.latest_pos().map_or(f32::MAX, |p| p.y));
-        let show_bar = pointer_y < rect.min.y + 64.0;
-        if show_bar {
-            let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 44.0));
-            painter.rect_filled(bar, 0.0, egui::Color32::from_black_alpha(170));
-            ui.scope_builder(
-                egui::UiBuilder::new().max_rect(bar.shrink2(egui::vec2(8.0, 6.0))),
-                |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("⏸").on_hover_text("pause").clicked() {
-                            self.emu.set_paused(!self.emu.paused());
-                        }
-                        if ui.button("⟲").on_hover_text("reset").clicked() {
-                            self.emu.request_reset();
-                        }
-                        if ui.button("✕").on_hover_text("power off").clicked() {
-                            self.power_off();
-                        }
-                        let stats = self.emu.stats();
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{:.0} fps", stats.emulated_fps))
-                                    .small()
-                                    .color(TEXT_DIM),
-                            );
-                        });
-                    });
-                },
-            );
-        }
-        if !self.fz1_tray_open {
+        // The picture carries no chrome but the hamburger: the controls live in
+        // the menu it opens, not over the game.
+        if self.chrome_shown(ctx) {
             self.disc_swap_strip(ui, rect);
-            self.eject_corner(ui, rect);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.fz1_tray_open = true;
+            self.open_frontend();
         }
-        ctx.request_repaint_after(Duration::from_millis(8));
+        // Present on the display's own cadence. A fixed 8 ms timer beats
+        // against both vsync and the 60 or 50 Hz the machine publishes at,
+        // and that beat is what reaches the eye as uneven motion. A plain
+        // repaint request is paced by the swapchain, and a repaint with no
+        // new field costs one blit of the texture already on the GPU.
+        ctx.request_repaint();
+        self.frame_log(dims.is_some());
     }
 
-    /// The turn handle in a view's top right: a click sets it spinning, a
-    /// second click stops it. Dragging the view still turns it by hand.
-    fn spin_handle(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let size = 20.0;
-        let spot = egui::Rect::from_min_size(
-            egui::pos2(rect.max.x - size - 6.0, rect.min.y + 6.0),
-            egui::vec2(size, size),
-        );
-        let press = ui.interact(spot, ui.id().with("spin"), egui::Sense::click());
-        let on = self.console_spin;
-        let painter = ui.painter();
-        painter.rect_filled(spot, 4.0, egui::Color32::from_black_alpha(140));
-        painter.text(
-            spot.center(),
-            egui::Align2::CENTER_CENTER,
-            "⟳",
-            egui::FontId::proportional(14.0),
-            if on || press.hovered() {
-                egui::Color32::WHITE
-            } else {
-                TEXT_DIM
-            },
-        );
-        if press.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    /// With RETRO3DO_FRAME_LOG set, report how evenly the picture reaches
+    /// the screen: the gap between presents, and the gap between the fields
+    /// the machine publishes. Off by default, and free when off.
+    fn frame_log(&mut self, new_field: bool) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("RETRO3DO_FRAME_LOG").is_some()) {
+            return;
         }
-        if press.clicked() {
-            self.console_spin = !self.console_spin;
+        let now = Instant::now();
+        if let Some(last) = self.present_last {
+            self.present_gaps.push(now.duration_since(last).as_secs_f64() * 1e3);
         }
+        self.present_last = Some(now);
+        if new_field {
+            if let Some(last) = self.field_last {
+                self.field_gaps.push(now.duration_since(last).as_secs_f64() * 1e3);
+            }
+            self.field_last = Some(now);
+        }
+        if self.present_gaps.len() < 300 {
+            return;
+        }
+        fn report(name: &str, gaps: &mut Vec<f64>) {
+            if gaps.is_empty() {
+                return;
+            }
+            gaps.sort_by(f64::total_cmp);
+            let n = gaps.len();
+            let mean = gaps.iter().sum::<f64>() / n as f64;
+            let at = |i: usize| gaps.get(i.min(n - 1)).copied().unwrap_or(0.0);
+            println!(
+                "{name}: n={n} mean={mean:.2}ms min={:.2} p50={:.2} p99={:.2} max={:.2}",
+                at(0),
+                at(n / 2),
+                at(n * 99 / 100),
+                at(n - 1)
+            );
+            gaps.clear();
+        }
+        let mut present = std::mem::take(&mut self.present_gaps);
+        let mut field = std::mem::take(&mut self.field_gaps);
+        report("present", &mut present);
+        report("field", &mut field);
+        let stats = self.emu.stats();
+        println!(
+            "emu: {:.2} fps, {:.2} ms/field, behind={}, resets={}, launcher3d={}",
+            stats.emulated_fps,
+            stats.frame_ms,
+            stats.frames_behind,
+            stats.deadline_resets,
+            if self.fz1.is_some() { "live" } else { "suspended" }
+        );
+        self.present_gaps = present;
+        self.field_gaps = field;
+    }
+
+    /// Play the RETRO3DO_SCRIPT automation: `secs:action` entries, where an
+    /// action is `shot:NAME` (window screenshot into RETRO3DO_SHOT_DIR),
+    /// `case:GAME`, `load:GAME` (GAME an index or part of a title), `esc`,
+    /// `click` (skip the show running) or `close`.
+    fn run_script(&mut self, ctx: &egui::Context) {
+        let shots: Vec<std::sync::Arc<ColorImage>> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        let dir = std::env::var("RETRO3DO_SHOT_DIR").unwrap_or_else(|_| ".".to_string());
+        for image in shots {
+            if let Some(name) = self.shots.pop_front() {
+                let path = format!("{dir}/{name}.png");
+                let _ = image::save_buffer(
+                    &path,
+                    image.as_raw(),
+                    image.size[0] as u32,
+                    image.size[1] as u32,
+                    image::ExtendedColorType::Rgba8,
+                );
+                println!("shot {path}");
+            }
+        }
+        if self.script.is_empty() {
+            return;
+        }
+        ctx.request_repaint();
+        let now = self.launched.elapsed().as_secs_f32();
+        while self.script.first().is_some_and(|(at, _)| *at <= now) {
+            let (_, action) = self.script.remove(0);
+            let (verb, arg) = action.split_once(':').unwrap_or((action.as_str(), ""));
+            let game = arg.parse::<usize>().ok().or_else(|| {
+                let want = arg.to_lowercase();
+                self.games.iter().position(|g| g.title.to_lowercase().contains(&want))
+            });
+            println!("script {now:.1}s {action}");
+            match verb {
+                "shot" => {
+                    self.shots.push_back(arg.to_string());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                }
+                "case" => {
+                    if let Some(g) = game {
+                        self.open_case(g);
+                    }
+                }
+                "load" => {
+                    if let Some(g) = game {
+                        self.start_load(g);
+                    }
+                }
+                "esc" => {
+                    if self.game_live() {
+                        self.open_frontend();
+                    } else if self.emu.running() && self.frontend {
+                        self.frontend = false;
+                        self.emu.set_paused(false);
+                    }
+                }
+                "click" => {
+                    if self.load.is_some() {
+                        self.finish_load();
+                    } else {
+                        self.intro = 1.0;
+                        self.fz1_state.unbox = 1.0;
+                        self.fz1_state.yaw = YAW0;
+                        self.spun = true;
+                        self.intro_done();
+                    }
+                }
+                "tray" => self.toggle_tray(),
+                "scroll" => self.settings_scroll = arg.parse().ok(),
+                "dirs" => self.apply_dirs(),
+                "smooth" => {
+                    self.cfg.smooth = !self.cfg.smooth;
+                    let _ = self.cfg.save_settings();
+                }
+                "settings" => self.open_settings(),
+                "settings-back" => self.close_settings(),
+                "section" => {
+                    if let Some((tab, _, _)) =
+                        SETTINGS_TABS.iter().find(|(_, n, _)| n.eq_ignore_ascii_case(arg))
+                    {
+                        self.settings_tab = *tab;
+                    }
+                }
+                // The script cannot inject pointer events the chrome would
+                // see, so this is the touch that wakes it.
+                "poke" => self.chrome_woke = Instant::now(),
+                "menu" => self.chrome_menu(),
+                "close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                _ => {}
+            }
+        }
+    }
+
+    /// Set the game aside for the launcher: it pauses under it.
+    fn open_frontend(&mut self) {
+        self.frontend = true;
+        self.emu.set_paused(true);
     }
 
     /// One pad in a view of its own. Clicking it picks it up: that is the
@@ -2647,36 +3674,500 @@ impl GuiApp {
         });
     }
 
-    /// The eject corner: the way back to choosing a game from the picture.
-    fn eject_corner(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let size = 34.0;
-        let spot = egui::Rect::from_min_size(
-            egui::pos2(rect.max.x - size - 12.0, rect.min.y + 12.0),
-            egui::vec2(size, size),
+    /// Go to the settings page, with the folder fields filled from the
+    /// settings in force and the way back pointed at this view.
+    fn open_settings(&mut self) {
+        self.set_dirs = Some((
+            self.cfg.games_dir.display().to_string(),
+            self.cfg.bios_dir.display().to_string(),
+            self.cfg.media_dir.display().to_string(),
+        ));
+        self.rebind = None;
+        if self.view != View::Settings {
+            self.settings_back = self.view;
+        }
+        self.view = View::Settings;
+    }
+
+    /// Leave the settings page for the view the cog was pressed on.
+    fn close_settings(&mut self) {
+        self.rebind = None;
+        if self.view == View::Settings {
+            self.view = self.settings_back;
+        }
+    }
+
+    /// The rebind table: one row a 3DO button, showing what drives it and a
+    /// button that listens for a new one.
+    #[cfg(not(target_os = "android"))]
+    fn pad_rebind(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("rebind")
+            .num_columns(3)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                for (i, (three, _)) in sdl_pad::THREE_DO.iter().enumerate() {
+                    let bound = self
+                        .cfg
+                        .pad_bind
+                        .iter()
+                        .find(|(n, _)| n == three)
+                        .map_or_else(|| "-".to_string(), |(_, sdl)| sdl.clone());
+                    ui.label(*three);
+                    ui.label(egui::RichText::new(bound).color(TEXT_DIM).monospace());
+                    let listening = self.rebind == Some(i);
+                    let label = if listening { "press a button" } else { "rebind" };
+                    if ui.button(label).clicked() {
+                        self.rebind = if listening { None } else { Some(i) };
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Android's pads come from the Java shim with a mapping of their own.
+    #[cfg(target_os = "android")]
+    fn pad_rebind(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("Android pads use the system mapping.")
+                .small()
+                .color(TEXT_DIM),
         );
-        let press = ui.interact(spot, ui.id().with("eject-corner"), egui::Sense::click());
-        let painter = ui.painter();
-        painter.rect_filled(
-            spot,
-            6.0,
-            egui::Color32::from_black_alpha(if press.hovered() { 220 } else { 150 }),
+    }
+
+    /// While a row is listening, the next pad button pressed takes it.
+    /// Returns true when something was bound, so the caller can save.
+    #[cfg(not(target_os = "android"))]
+    fn poll_rebind(&mut self) -> bool {
+        let Some(i) = self.rebind else {
+            return false;
+        };
+        let Some((three, _)) = sdl_pad::THREE_DO.get(i) else {
+            self.rebind = None;
+            return false;
+        };
+        let primary = self.cfg.pad_primary;
+        let Some(sdl) = self.io.as_ref().and_then(|io| io.pressed(primary)) else {
+            return false;
+        };
+        // One SDL button drives one 3DO button: whatever else it was bound
+        // to lets go of it.
+        self.cfg.pad_bind.retain(|(n, s)| n != three && s != sdl);
+        self.cfg.pad_bind.push((three.to_string(), sdl.to_string()));
+        self.rebind = None;
+        let bind = self.cfg.pad_bind.clone();
+        if let Some(io) = self.io.as_mut() {
+            io.set_bindings(&bind);
+        }
+        self.status = format!("{three} is {sdl}");
+        true
+    }
+
+    #[cfg(target_os = "android")]
+    fn poll_rebind(&mut self) -> bool {
+        false
+    }
+
+    /// Point the library at other folders and read them again.
+    fn apply_dirs(&mut self) {
+        let Some((games, bios, media)) = self.set_dirs.clone() else {
+            return;
+        };
+        self.cfg.games_dir = PathBuf::from(games.trim());
+        self.cfg.bios_dir = PathBuf::from(bios.trim());
+        self.cfg.media_dir = PathBuf::from(media.trim());
+        self.games = scan_games(&self.cfg);
+        self.bioses = scan_bios(&self.cfg);
+        if self
+            .bios_choice
+            .as_ref()
+            .is_none_or(|b| !self.bioses.contains(b))
+        {
+            self.bios_choice = self.bioses.first().cloned();
+        }
+        self.cfg.bios_choice = self.bios_choice.clone();
+        self.selected = None;
+        self.case_open = None;
+        self.refresh_covers();
+        self.extract_logo();
+        self.status = format!(
+            "{} games, {} BIOS files",
+            self.games.len(),
+            self.bioses.len()
         );
-        painter.text(
-            spot.center(),
-            egui::Align2::CENTER_CENTER,
-            "⏏",
-            egui::FontId::proportional(18.0),
-            if press.hovered() {
-                egui::Color32::WHITE
-            } else {
-                TEXT_DIM
+    }
+
+    /// The settings page: a page of its own, never a dialog squeezed over the
+    /// scene. A bar across the top carries the way back, the sections live
+    /// down the left, and the section on show has the rest of the window.
+    /// Every change is written to the settings file as it is made.
+    fn view_settings(&mut self, ui: &mut egui::Ui) {
+        let mut save = self.poll_rebind();
+        let mut apply = false;
+        let mut back = false;
+
+        let page = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(page, 0.0, BG);
+
+        // The top bar: the way back to wherever the cog was pressed.
+        let header = egui::Rect::from_min_size(page.min, egui::vec2(page.width(), 74.0));
+        ui.painter().rect_filled(header, 0.0, PANEL);
+        ui.painter()
+            .hline(page.x_range(), header.max.y, egui::Stroke::new(1.0, CARD));
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(header.shrink2(egui::vec2(26.0, 16.0))),
+            |ui| {
+                ui.horizontal_centered(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("\u{2039}  Back").size(15.0),
+                            )
+                            .min_size(egui::vec2(104.0, 36.0)),
+                        )
+                        .on_hover_text("Back to where you came from (Esc)")
+                        .clicked()
+                    {
+                        back = true;
+                    }
+                    ui.add_space(18.0);
+                    ui.label(egui::RichText::new("Settings").size(25.0).strong());
+                });
             },
         );
-        if press.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+
+        // The sections, down the left: one is on screen at a time, so nothing
+        // has to be scrolled past to reach anything else.
+        let body = egui::Rect::from_min_max(egui::pos2(page.min.x, header.max.y), page.max);
+        let nav_w = (body.width() * 0.26).clamp(150.0, 230.0);
+        let nav = egui::Rect::from_min_size(body.min, egui::vec2(nav_w, body.height()));
+        ui.painter()
+            .vline(nav.max.x, body.y_range(), egui::Stroke::new(1.0, CARD));
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(nav.shrink2(egui::vec2(16.0, 22.0))),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for (tab, name, hint) in SETTINGS_TABS {
+                    let on = self.settings_tab == tab;
+                    let hit = ui.add_sized(
+                        [ui.available_width(), 42.0],
+                        egui::Button::selectable(on, egui::RichText::new(name).size(16.0)),
+                    );
+                    if hit.on_hover_text(hint).clicked() {
+                        self.settings_tab = tab;
+                    }
+                }
+            },
+        );
+
+        // The section itself, with room around it however wide the window is.
+        let pane = egui::Rect::from_min_max(egui::pos2(nav.max.x, body.min.y), body.max);
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(pane.shrink2(egui::vec2(34.0, 24.0))),
+            |ui| {
+                let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                if let Some(at) = self.settings_scroll.take() {
+                    area = area.vertical_scroll_offset(at);
+                }
+                area.show(ui, |ui| {
+                    let measure = ui.available_width().min(720.0);
+                    ui.set_max_width(measure);
+                    match self.settings_tab {
+                        SettingsTab::Controller => save |= self.settings_controller(ui),
+                        SettingsTab::Video => save |= self.settings_video(ui),
+                        SettingsTab::Paths => save |= self.settings_paths(ui, &mut apply),
+                        SettingsTab::System => save |= self.settings_system(ui),
+                    }
+                });
+            },
+        );
+
+        if back {
+            self.close_settings();
         }
-        if press.clicked() {
-            self.eject_disc();
+        if apply {
+            self.apply_dirs();
+            save = true;
+        }
+        if save {
+            if let Err(e) = self.cfg.save_settings() {
+                self.status = format!("could not save settings: {e}");
+            }
+        }
+    }
+
+    /// Controller: which pad drives the machine, and what each 3DO button is.
+    fn settings_controller(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut save = false;
+        settings_head(
+            ui,
+            "Controller",
+            "Which pad drives the machine, and what each 3DO button answers to.",
+        );
+        let pads = self.pad_names();
+        settings_card(ui, "The pad", |ui| {
+            if pads.is_empty() {
+                ui.label(
+                    egui::RichText::new("No pads detected - the keyboard drives pad 0.")
+                        .color(TEXT_DIM),
+                );
+            }
+            for (i, name) in pads.iter().enumerate() {
+                if ui
+                    .radio(self.cfg.pad_primary == i, format!("{i}   {name}"))
+                    .clicked()
+                {
+                    self.cfg.pad_primary = i;
+                    save = true;
+                }
+            }
+        });
+        ui.add_space(16.0);
+        settings_card(ui, "Buttons", |ui| {
+            ui.label(
+                egui::RichText::new("Click rebind, then press the button on the pad.")
+                    .small()
+                    .color(TEXT_DIM),
+            );
+            ui.add_space(10.0);
+            self.pad_rebind(ui);
+            ui.add_space(12.0);
+            if ui.button("stock mapping").clicked() {
+                self.cfg.pad_bind = default_bindings();
+                let bind = self.cfg.pad_bind.clone();
+                if let Some(io) = self.io.as_mut() {
+                    io.set_bindings(&bind);
+                }
+                save = true;
+            }
+        });
+        save
+    }
+
+    /// Video: how the machine's picture reaches the window.
+    fn settings_video(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut save = false;
+        settings_head(
+            ui,
+            "Video",
+            "How the machine's picture is scaled up to the window.",
+        );
+        settings_card(ui, "Scaling", |ui| {
+            let mut smooth = self.cfg.smooth;
+            if ui
+                .checkbox(&mut smooth, "Smooth rendering (bilinear filter)")
+                .changed()
+            {
+                self.cfg.smooth = smooth;
+                save = true;
+            }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Off keeps every pixel square and crisp; on blends them as the \
+                     picture is scaled up to the window.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
+        });
+        save
+    }
+
+    /// Paths: the folders the library, the BIOS images and the artwork are
+    /// read from.
+    fn settings_paths(&mut self, ui: &mut egui::Ui, apply: &mut bool) -> bool {
+        settings_head(ui, "Paths", "Where the library is read from.");
+        settings_card(ui, "Folders", |ui| {
+            let mut browse = None;
+            if let Some(dirs) = self.set_dirs.as_mut() {
+                for (label, step, field) in [
+                    ("Games  ", 11usize, &mut dirs.0),
+                    ("BIOS   ", 12, &mut dirs.1),
+                    ("Artwork", 13, &mut dirs.2),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(label).monospace());
+                        let room = (ui.available_width() - 104.0).max(140.0);
+                        ui.add(egui::TextEdit::singleline(field).desired_width(room));
+                        if ui.button("browse\u{2026}").clicked() {
+                            browse = Some((step, field.clone()));
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+            }
+            if let Some((step, at)) = browse {
+                self.open_picker(step, &at);
+            }
+        });
+        ui.add_space(16.0);
+        settings_card(ui, "Read them again", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "The library is scanned when you ask: nothing is read until then.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
+            ui.add_space(10.0);
+            if ui
+                .add(
+                    egui::Button::new("read these folders")
+                        .min_size(egui::vec2(176.0, 32.0)),
+                )
+                .clicked()
+            {
+                *apply = true;
+            }
+        });
+        false
+    }
+
+    /// System: the BIOS the machine boots and the headroom its CPU is given.
+    fn settings_system(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut save = false;
+        settings_head(
+            ui,
+            "System",
+            "The ROM the machine boots, and the headroom its CPU is given.",
+        );
+        let bioses = self.bioses.clone();
+        settings_card(ui, "BIOS", |ui| {
+            if bioses.is_empty() {
+                ui.label(
+                    egui::RichText::new("No BIOS images in the BIOS folder.")
+                        .color(TEXT_DIM),
+                );
+            }
+            for name in &bioses {
+                let on = self.bios_choice.as_deref() == Some(name.as_str());
+                if ui.radio(on, name).clicked() {
+                    self.bios_choice = Some(name.clone());
+                    self.cfg.bios_choice = self.bios_choice.clone();
+                    self.extract_logo();
+                    save = true;
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "A different ROM takes the machine from the next power-on.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
+        });
+        ui.add_space(16.0);
+        settings_card(ui, "CPU", |ui| {
+            let mut scale = self.cfg.cpu_scale;
+            if ui
+                .add(
+                    egui::Slider::new(&mut scale, 100..=150)
+                        .suffix(" %")
+                        .text("overclock"),
+                )
+                .changed()
+            {
+                self.cfg.cpu_scale = scale;
+                self.emu.set_cpu_scale_percent(scale);
+                save = true;
+            }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "More ARM work per field, no other clock moved: it helps games \
+                     the real hardware itself struggled with.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
+        });
+        save
+    }
+
+    /// Open the folder picker on a path field, starting where it points.
+    fn open_picker(&mut self, step: usize, at: &str) {
+        let start = at.trim();
+        let start = if start.is_empty() {
+            start_dir()
+        } else {
+            PathBuf::from(start)
+        };
+        self.picker = Some(if start.is_dir() {
+            start
+        } else {
+            start.parent().map(Path::to_path_buf).unwrap_or(start)
+        });
+        self.picker_step = step;
+    }
+
+
+    /// Whether the overlay chrome is on screen. A game on the window gets the
+    /// picture and nothing else until the player touches something; the
+    /// launcher always shows the icons.
+    fn chrome_shown(&mut self, ctx: &egui::Context) -> bool {
+        let touched = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.pointer.is_moving()
+                || i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::PointerButton { .. }
+                            | egui::Event::PointerMoved(_)
+                            | egui::Event::Touch { .. }
+                            | egui::Event::Key { .. }
+                            | egui::Event::MouseWheel { .. }
+                    )
+                })
+        });
+        if touched {
+            self.chrome_woke = Instant::now();
+        }
+        if !self.game_live() {
+            return true;
+        }
+        if self.chrome_woke.elapsed() < CHROME_IDLE {
+            // Come back when the three seconds are up: the picture alone would
+            // keep the icons on screen until the next field arrived.
+            ctx.request_repaint_after(CHROME_IDLE);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The hamburger: the shelf from a running game, and the way back into
+    /// the game from the launcher over it.
+    fn chrome_menu(&mut self) {
+        if self.game_live() {
+            self.open_frontend();
+        } else if self.emu.running() && self.frontend {
+            self.frontend = false;
+            self.emu.set_paused(false);
+        }
+    }
+
+    /// The floating corner: the hamburger (the menu — the shelf from a game,
+    /// the way back into it from the launcher) and the cog (settings), side by
+    /// side over everything else.
+    fn chrome_icons(&mut self, ctx: &egui::Context) {
+        let mut menu = false;
+        let mut cog = false;
+        egui::Area::new(egui::Id::new("chrome-icons"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    menu = icon_button(ui, "\u{2630}", "The menu");
+                    cog = icon_button(ui, "\u{2699}", "Settings");
+                });
+            });
+        if menu {
+            self.chrome_menu();
+        }
+        if cog {
+            self.open_settings();
         }
     }
 
@@ -2692,6 +4183,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(if e.starts_with("usage") { 0 } else { 2 });
         }
     };
+    if cfg.resolve {
+        resolve_report(&cfg);
+        return Ok(());
+    }
     run(cfg, None)
 }
 
@@ -2883,6 +4378,12 @@ mod tests {
             bios_choice: None,
             configured: true,
             texdir: None,
+            name_map: HashMap::new(),
+            resolve: false,
+            smooth: false,
+            cpu_scale: 100,
+            pad_primary: 0,
+            pad_bind: default_bindings(),
         };
         let games = scan_games(&cfg);
         let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
@@ -2922,11 +4423,148 @@ mod tests {
     fn the_platter_shows_the_disc_in_the_drive() {
         // A title highlighted in the shelf is a choice, not an insertion:
         // with nothing in the drive the platter is bare.
-        assert_eq!(platter_title(Some(3), false, false), None);
-        assert_eq!(platter_title(Some(3), true, false), Some(3));
+        assert_eq!(platter_title(Some(3), false, false, false), None);
+        assert_eq!(platter_title(Some(3), true, false, false), Some(3));
         // Ejected, but the spindle has not stopped yet: the disc is still
         // coasting down on the platter.
-        assert_eq!(platter_title(Some(3), false, true), Some(3));
-        assert_eq!(platter_title(None, true, true), None);
+        assert_eq!(platter_title(Some(3), false, true, false), Some(3));
+        // Spun down and run out: the disc waits on the open drawer.
+        assert_eq!(platter_title(Some(3), false, false, true), Some(3));
+        assert_eq!(platter_title(None, true, true, false), None);
+        assert_eq!(platter_title(None, false, false, true), None);
+    }
+
+    /// A scratch library: a games folder and a media folder.
+    fn scratch_library() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "retro3do-art-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join("games")).unwrap();
+        std::fs::create_dir_all(root.join("media")).unwrap();
+        root
+    }
+
+    fn scratch_config(root: &Path) -> Config {
+        Config {
+            games_dir: root.join("games"),
+            media_dir: root.join("media"),
+            bios_dir: root.join("bios"),
+            saves_dir: root.join("saves"),
+            boot: None,
+            play: None,
+            docs_dir: root.join("docs"),
+            bios_choice: None,
+            configured: true,
+            texdir: None,
+            name_map: HashMap::new(),
+            resolve: false,
+            smooth: false,
+            cpu_scale: 100,
+            pad_primary: 0,
+            pad_bind: default_bindings(),
+        }
+    }
+
+    #[test]
+    fn region_and_revision_tags_go_but_the_disc_stays() {
+        assert_eq!(normalize("Killing Time (USA) (RE1)"), "killing time");
+        assert_eq!(normalize("PGA Tour 96 (USA) (RE-1)"), "pga tour 96");
+        assert_eq!(
+            normalize("Flashback - The Quest for Identity (USA) (En,Fr)"),
+            "flashback quest for identity"
+        );
+        assert_eq!(
+            normalize("Wing Commander III - Heart of the Tiger (USA, Europe) (Disc 1)"),
+            "wing commander iii heart of tiger disc 1"
+        );
+    }
+
+    #[test]
+    fn an_exact_name_beats_a_longer_one() {
+        let art = vec![
+            PathBuf::from("Alone in the Dark 2 (USA).png"),
+            PathBuf::from("Alone in the Dark (USA).png"),
+        ];
+        let stem = normalize("Alone in the Dark (USA)");
+        assert_eq!(
+            match_media(&stem, &art).map(|p| file_stem(p)),
+            Some("Alone in the Dark (USA)".to_string())
+        );
+    }
+
+    #[test]
+    fn the_map_names_the_file_when_the_names_disagree() {
+        let root = scratch_library();
+        let media = root.join("media");
+        std::fs::create_dir_all(media.join("box2d")).unwrap();
+        std::fs::write(media.join("box2d").join("Odd Name.png"), b"x").unwrap();
+        std::fs::write(
+            root.join("name-map.tsv"),
+            "Some Game (USA)\tbox2d\tOdd Name.png\n",
+        )
+        .unwrap();
+        let mut cfg = scratch_config(&root);
+        cfg.name_map = load_name_map(&cfg);
+        let candidates = scan_dir(&media.join("box2d"), &["png"]);
+        assert_eq!(
+            resolve_media(&cfg, "Some Game (USA)", &["box2d"], &candidates),
+            Some(media.join("box2d").join("Odd Name.png"))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn one_disc_falls_back_to_the_sets_art() {
+        let root = scratch_library();
+        let media = root.join("media");
+        std::fs::create_dir_all(media.join("images")).unwrap();
+        let set = media.join("images").join(
+            "Wing Commander III - Heart of the Tiger (USA) (Disc 1).png",
+        );
+        std::fs::write(&set, b"x").unwrap();
+        let cfg = scratch_config(&root);
+        let candidates = scan_dir(&media.join("images"), &["png"]);
+        assert_eq!(
+            resolve_media(
+                &cfg,
+                "Wing Commander III - Heart of the Tiger (USA, Europe) (Disc 2)",
+                &["images"],
+                &candidates
+            ),
+            Some(set)
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+    #[test]
+    fn the_tray_disc_wears_the_scan_and_never_the_cover() {
+        let root = scratch_library();
+        let media = root.join("media");
+        std::fs::create_dir_all(media.join("discs")).unwrap();
+        std::fs::create_dir_all(media.join("box2d")).unwrap();
+        std::fs::write(media.join("discs").join("Some Game (USA).png"), b"x").unwrap();
+        std::fs::write(media.join("box2d").join("Some Game (USA).png"), b"y").unwrap();
+        let mut cfg = scratch_config(&root);
+        cfg.name_map = load_name_map(&cfg);
+        let scans = scan_dir(&media.join("discs"), &["png"]);
+        // The disc wears its own scan, not the cover filed beside it.
+        assert_eq!(
+            resolve_disc_scan(&cfg, "Some Game (USA)", &scans),
+            Some(media.join("discs").join("Some Game (USA).png"))
+        );
+        // A title with no scan has no disc art at all: what the tray gets
+        // then is the plain printed platter, never the cover.
+        assert!(resolve_disc_scan(&cfg, "Other Game (USA)", &scans).is_none());
+        let plain = case_art::disc(&case_art::CaseArt {
+            title: "Other Game".to_string(),
+            front: Some(media.join("box2d").join("Some Game (USA).png")),
+            ..Default::default()
+        });
+        assert_eq!(plain.size, [case_art::DISC_TEX as usize; 2]);
+        assert_eq!(plain.pixels[0].a(), 0, "the platter's corner is clear");
     }
 }

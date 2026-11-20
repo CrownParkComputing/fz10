@@ -161,8 +161,15 @@ impl WriteWatch {
     }
 
     /// The dirty pages, in ascending order.
+    ///
+    /// Walks the bitmap word by word rather than testing every page: the
+    /// watch is consulted once per slice, and a scan of all pages costs more
+    /// than the invalidation it guards.
     pub fn dirty_pages(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..Self::PAGES).filter(|&page| self.page_dirty(page))
+        self.bits.iter().enumerate().flat_map(|(index, &word)| SetBits {
+            word,
+            base: (index * 64) as u32,
+        })
     }
 
     pub fn clear(&mut self) {
@@ -174,6 +181,25 @@ impl WriteWatch {
 impl Default for WriteWatch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The set bits of one word of the dirty bitmap, lowest first.
+struct SetBits {
+    word: u64,
+    base: u32,
+}
+
+impl Iterator for SetBits {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.word == 0 {
+            return None;
+        }
+        let bit = self.word.trailing_zeros();
+        self.word &= self.word - 1;
+        Some(self.base + bit)
     }
 }
 

@@ -924,7 +924,7 @@ impl Vdlp {
             let (upper, lower) = pair.split_at_mut(output_width.min(pair.len()));
             let below_y = if y + 1 < height { y + 1 } else { y };
             let mode = field.modes.get(y as usize).copied().unwrap_or_default();
-            expand_line(field.row(y), field.row(below_y), mode, upper, lower);
+            expand_line_fast(field.row(y), field.row(below_y), mode, upper, lower);
         }
     }
 
@@ -1015,6 +1015,7 @@ const fn average4(a: u32, b: u32, c: u32, d: u32) -> u32 {
 /// The 2x2 block for one logical pixel: `[upper-left, upper-right]` and
 /// `[lower-left, lower-right]`. `right` is `None` at the right edge, where the
 /// horizontal neighbour clamps; `below` is the pixel itself on the last line.
+#[cfg(test)]
 fn expand_pixel(
     here: u32,
     right: Option<u32>,
@@ -1111,6 +1112,10 @@ fn expand_line_fast(
 }
 
 /// Expand one logical line into its two output lines.
+///
+/// The straightforward form, kept as the reference the fast path is tested
+/// against; the field expansion itself uses [`expand_line_fast`].
+#[cfg(test)]
 fn expand_line(
     row: &[u32],
     below_row: &[u32],

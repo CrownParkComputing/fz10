@@ -1,13 +1,20 @@
-//! The FZ-1 console as a real 3D model, rendered with wgpu inside egui.
+//! The launcher's 3D scene, rendered with wgpu inside egui: the FZ-1, the
+//! retail carton it comes out of, and a game's case.
 //!
-//! The model is assets/fz1.glb: a measured replica of the Panasonic FZ-1
-//! (284x268x88 mm) from the "FZ-1 Turntable" interactive page. It carries
-//! one animation, `TrayOpen`, sliding `TrayRoot` (the drawer and the disc
-//! on it) forward, and the Disc material is UV-mapped so a square game
-//! label lands on it exactly.
+//! The models are generated (docs/make-fz1-model.py, docs/make-case-model.py):
 //!
-//! Everything draws offscreen into one texture that egui then paints like
-//! the game-frame path does.
+//! * assets/fz1.glb — a measured replica of the Panasonic FZ-1 (284x268x88
+//!   mm). It carries one animation, `TrayOpen`, sliding `TrayRoot` (the
+//!   drawer and the disc on it) forward, and the Disc material is UV-mapped
+//!   so a square picture lands on the platter exactly.
+//! * assets/fz1-box.glb — the carton, with a hinged `BoxLid` and two dust
+//!   flaps, which `carton_pose` opens and closes.
+//! * assets/dvd-case/case.glb — the game case, its `Wrap` UV-mapped as one
+//!   printed sleeve (see case_art.rs).
+//!
+//! Baked artwork in the files is uploaded once; the three pictures that
+//! change with the game (platter, sleeve, case disc) are slots the GUI fills.
+//! Everything draws offscreen into a texture that egui then paints.
 
 use eframe::egui_wgpu::{self, wgpu};
 
@@ -48,6 +55,26 @@ fn mat_translate(t: [f32; 3]) -> Mat4 {
         [0.0, 1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0, 0.0],
         [t[0], t[1], t[2], 1.0],
+    ]
+}
+
+fn mat_rot_x(a: f32) -> Mat4 {
+    let (s, c) = a.sin_cos();
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, c, s, 0.0],
+        [0.0, -s, c, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn mat_rot_z(a: f32) -> Mat4 {
+    let (s, c) = a.sin_cos();
+    [
+        [c, s, 0.0, 0.0],
+        [-s, c, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
     ]
 }
 
@@ -116,6 +143,11 @@ struct Part {
     color: [f32; 4],
     emissive: [f32; 3],
     textured: bool,
+    /// The material's name: the parts whose picture changes with the game
+    /// are found by it.
+    material: String,
+    /// The model's own baked image this part wears, if any.
+    image: Option<usize>,
     /// Mean of the part's own vertices, in node-local space: the point a
     /// click target sits on once it is projected.
     centre: [f32; 3],
@@ -123,8 +155,19 @@ struct Part {
     indices: Vec<u32>,
 }
 
+/// What a model is, which decides how it moves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Console,
+    Carton,
+    Case,
+}
+
 pub struct Model {
+    pub kind: Kind,
     parts: Vec<Part>,
+    /// Baked images, RGBA8: (width, height, pixels).
+    images: Vec<(u32, u32, Vec<u8>)>,
     /// Where this model sits in the scene: the shelf and the pad are placed
     /// around the console rather than at the origin.
     pub place: Mat4,
@@ -135,9 +178,40 @@ pub struct Model {
     tray_anim: Vec<(f32, [f32; 3])>,
     center: [f32; 3],
     radius: f32,
+    /// The model's own box, before `place`.
+    lo: [f32; 3],
+    hi: [f32; 3],
 }
 
 impl Model {
+    /// Work the framing box out again from the parts that are left, after
+    /// some have been dropped.
+    fn refit(&mut self) {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for part in &self.parts {
+            let world = mat_mul(&part.parent, &part.local);
+            for v in part.verts.as_chunks::<8>().0 {
+                let wp = transform_point(&world, [v[0], v[1], v[2]]);
+                for ((l, h), p) in lo.iter_mut().zip(hi.iter_mut()).zip(wp) {
+                    *l = l.min(p);
+                    *h = h.max(p);
+                }
+            }
+        }
+        if lo.iter().zip(hi).any(|(l, h)| *l > h) {
+            return;
+        }
+        for ((c, l), h) in self.center.iter_mut().zip(lo).zip(hi) {
+            *c = (l + h) * 0.5;
+        }
+        let span: f32 = lo.iter().zip(hi).map(|(l, h)| (h - l) * (h - l)).sum();
+        self.radius = (span.sqrt() * 0.5).max(0.05);
+        self.lo = lo;
+        self.hi = hi;
+    }
+
+    #[allow(dead_code)]
     /// The tray's translation at anim time `t` (clamped to the clip).
     fn tray_at(&self, t: f32) -> [f32; 3] {
         let anim = &self.tray_anim;
@@ -248,6 +322,10 @@ fn walk_node(
                 color: pbr.base_color_factor(),
                 emissive: mat.emissive_factor(),
                 textured: pbr.base_color_texture().is_some(),
+                material: mat.name().unwrap_or("").to_string(),
+                image: pbr
+                    .base_color_texture()
+                    .map(|t| t.texture().source().index()),
                 centre,
                 verts,
                 indices,
@@ -276,15 +354,6 @@ fn transform_clip(m: &Mat4, p: [f32; 3]) -> [f32; 4] {
     out
 }
 
-/// The uniform scale a placement matrix carries, so a model's own radius
-/// can be measured in scene units.
-fn scene_place_scale(m: &Mat4) -> f32 {
-    let col = m.first().copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
-    (col[0] * col[0] + col[1] * col[1] + col[2] * col[2])
-        .sqrt()
-        .max(1e-4)
-}
-
 fn transform_point(m: &Mat4, p: [f32; 3]) -> [f32; 3] {
     let mut out = [0.0f32; 3];
     for r in 0..3 {
@@ -302,13 +371,51 @@ fn transform_point(m: &Mat4, p: [f32; 3]) -> [f32; 3] {
 
 
 pub fn load_model() -> Option<Model> {
-    let bytes: &[u8] = include_bytes!("../../../assets/fz1.glb");
-    load_glb(bytes)
+    load_glb(include_bytes!("../../../assets/fz1.glb"), Kind::Console)
 }
 
-fn load_glb(bytes: &[u8]) -> Option<Model> {
-    let (doc, buffers, _images) = gltf::import_slice(bytes).ok()?;
+/// The retail carton the machine is unboxed from.
+pub fn load_carton() -> Option<Model> {
+    load_glb(include_bytes!("../../../assets/fz1-box.glb"), Kind::Carton)
+}
+
+/// The game case. In the file it lies flat (height along +X, width along
+/// +Z, front cover facing +Y); stood up it faces the camera. The file also
+/// carries a disc beside the box, which is dropped here: the preview shows
+/// the sleeve alone, and a disc is only ever seen going into the drive.
+pub fn load_case() -> Option<Model> {
+    let mut m = load_glb(include_bytes!("../../../assets/dvd-case/case.glb"), Kind::Case)?;
+    m.parts
+        .retain(|p| !matches!(p.name.as_str(), "CaseDisc" | "DiscHub" | "DiscRing"));
+    m.refit();
+    m.place = mat_mul(&mat_rot_z(std::f32::consts::FRAC_PI_2), &mat_rot_x(std::f32::consts::FRAC_PI_2));
+    Some(m)
+}
+
+fn rgba8(img: &gltf::image::Data) -> Option<(u32, u32, Vec<u8>)> {
+    use gltf::image::Format;
+    let px = match img.format {
+        Format::R8G8B8A8 => img.pixels.clone(),
+        Format::R8G8B8 => img
+            .pixels
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|[r, g, b]| [*r, *g, *b, 255])
+            .collect(),
+        _ => return None,
+    };
+    Some((img.width, img.height, px))
+}
+
+fn load_glb(bytes: &[u8], kind: Kind) -> Option<Model> {
+    let (doc, buffers, images) = gltf::import_slice(bytes).ok()?;
     let mut model = Model {
+        kind,
+        images: images
+            .iter()
+            .map(|i| rgba8(i).unwrap_or((1, 1, vec![255; 4])))
+            .collect(),
         parts: Vec::new(),
         place: mat_identity(),
         tray_rest: None,
@@ -316,6 +423,8 @@ fn load_glb(bytes: &[u8]) -> Option<Model> {
         tray_anim: Vec::new(),
         center: [0.0; 3],
         radius: 0.2,
+        lo: [0.0; 3],
+        hi: [0.0; 3],
     };
     for anim in doc.animations() {
         if !anim.name().is_some_and(|n| n == "TrayOpen") {
@@ -369,46 +478,9 @@ fn load_glb(bytes: &[u8]) -> Option<Model> {
     let dy = hi[1] - lo[1];
     let dz = hi[2] - lo[2];
     model.radius = ((dx * dx + dy * dy + dz * dz).sqrt() * 0.5).max(0.05);
-    // The front lamps are not in the GLB: each is an emissive pad tucked a
-    // millimetre behind its button strip and a little wider, so the light
-    // bleeds through the gap around the button the way the real backlit
-    // strips work — nothing lit sits on the face itself. Red behind the
-    // left (power) strip, green behind the right (access) one.
-    model.parts.push(lamp_pad(
-        "ReadyGlow",
-        [-0.11, 0.0553, 0.131],
-        [0.018, 0.006],
-        [0.9, 0.08, 0.03],
-    ));
-    model.parts.push(lamp_pad(
-        "AccessGlow",
-        [0.11, 0.0553, 0.131],
-        [0.018, 0.006],
-        [0.15, 0.95, 0.25],
-    ));
+    model.lo = lo;
+    model.hi = hi;
     Some(model)
-}
-
-/// A flat emissive quad, facing out the front of the machine: the light
-/// source behind a button strip. Its own colour is the lamp's; the shader
-/// adds it back at the gain `Fz1State` sets for the lamp.
-fn lamp_pad(name: &str, at: [f32; 3], half: [f32; 2], rgb: [f32; 3]) -> Part {
-    let [hx, hy] = half;
-    let mut verts = Vec::with_capacity(32);
-    for (cx, cy) in [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)] {
-        verts.extend_from_slice(&[cx, cy, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-    }
-    Part {
-        name: name.to_string(),
-        local: mat_translate(at),
-        parent: mat_identity(),
-        color: [rgb[0], rgb[1], rgb[2], 1.0],
-        emissive: [1.0, 1.0, 1.0],
-        textured: false,
-        centre: [0.0; 3],
-        verts,
-        indices: vec![0, 1, 2, 0, 2, 3],
-    }
 }
 
 // --- gpu renderer ----------------------------------------------------------
@@ -458,7 +530,12 @@ fn fs(in: VsOut) -> @location(0) vec4f {
     // Lift it out of the dark: the real unit is near-black plastic, which
     // reads as a hole on a dark page, so the material gets a floor and a
     // little sheen on top of the lighting.
-    let lit = base.rgb * (0.8 + light) + vec3f(0.1) * light;
+    var lit = base.rgb * (0.8 + light) + vec3f(0.1) * light;
+    if u.params.z > 0.5 {
+        // Printed card and a pressed disc are not dark plastic: plain
+        // lighting, so the artwork keeps its own colours.
+        lit = base.rgb * (0.35 + 0.65 * light);
+    }
     let rgb = lit + vec3f(u.params.y) * base.rgb;
     return vec4f(rgb, base.a);
 }
@@ -472,16 +549,51 @@ struct GpuPart {
     bind: wgpu::BindGroup,
 }
 
-/// One picture the renderer draws into: the machine has one, each pad has
-/// its own, so a pad is its own little view rather than part of the console's
-/// scene.
+/// One picture the renderer draws into: the machine's view and the case
+/// view each have their own.
+/// How far the drawer runs out, in metres. The platter's rear edge sits
+/// 32 mm behind the model's origin and the console's front face is 112 mm in
+/// front of it, so the disc only comes fully clear of the case after 144 mm
+/// of travel - then a CD can be dropped onto the tray flat from above.
+pub const TRAY_TRAVEL: f32 = 0.150;
+
 #[derive(Default)]
 struct Target {
     color: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// The multisampled picture the pass draws into, resolved into `color`.
+    msaa: Option<wgpu::TextureView>,
     depth: Option<(wgpu::Texture, wgpu::TextureView)>,
     tex_id: Option<egui::TextureId>,
     w: u32,
     h: u32,
+}
+
+/// The pictures that change with the game.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArtSlot {
+    /// What the disc on the FZ-1's tray wears: the game's own disc art.
+    Platter,
+    /// The case's printed sleeve: back, spine and front on one sheet.
+    Wrap,
+}
+
+impl ArtSlot {
+    /// The canvas size the slot takes, which the art has to match exactly:
+    /// the UVs map 0..1 across it.
+    pub const fn size(self) -> (u32, u32) {
+        match self {
+            ArtSlot::Platter => (DISC_TEX_SIZE, DISC_TEX_SIZE),
+            ArtSlot::Wrap => (WRAP_TEX_W, WRAP_TEX_H),
+        }
+    }
+
+    fn of_material(name: &str) -> Option<Self> {
+        match name {
+            "Disc" => Some(ArtSlot::Platter),
+            "Wrap" => Some(ArtSlot::Wrap),
+            _ => None,
+        }
+    }
 }
 
 pub struct Fz1Renderer {
@@ -491,16 +603,17 @@ pub struct Fz1Renderer {
     targets: Vec<Target>,
     /// Part name, where its centre landed on the image (0..1), and its depth.
     points: Vec<(String, [f32; 2], f32)>,
-    disc_tex: wgpu::Texture,
-    disc_view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
+    /// The game-dependent pictures, by `ArtSlot` order, and every baked
+    /// image the models carry (kept alive for their bind groups).
+    slots: Vec<wgpu::Texture>,
+    _baked: Vec<wgpu::Texture>,
 }
 
 /// Per-frame animation state driven by the GUI.
 #[derive(Default)]
 pub struct Fz1State {
     /// Orbit: radians around the machine and above it, and how far back the
-    /// eye sits as a multiple of the model's radius.
+    /// eye sits as a multiple of what fits the frame.
     pub yaw: f32,
     pub pitch: f32,
     pub zoom: f32,
@@ -509,18 +622,120 @@ pub struct Fz1State {
     pub tray_goal: f32,
     /// Radians the disc has spun.
     pub spin: f32,
-    /// Which way a pad view is turned, when one is being shown.
-    pub pad_yaw: f32,
-    pub pad_pitch: f32,
-    /// Power/ready lamps lit.
+    /// The case view's own orbit and distance.
+    pub case_yaw: f32,
+    pub case_pitch: f32,
+    pub case_zoom: f32,
+    /// Whether there is a disc on the platter at all. A disc is something the
+    /// launcher puts in once a game has been picked, so the idle machine has
+    /// an empty tray rather than a blank disc prop sitting in it.
+    pub disc_shown: bool,
+    /// How far a disc being put in has come down onto the spindle, 0 to 1.
+    pub disc_drop: f32,
+    /// Power/ready lamp lit.
     pub lit: bool,
-    /// The ACCESS lamp's level, 0..1. It stays dark while the machine idles
-    /// and the GUI blinks it while the BIOS comes up or the drawer runs
-    /// out — disc access is the only thing it ever shows.
+    /// The ACCESS lamp's level, 0..1.
     pub access: f32,
+    /// How far the machine has come out of its carton: 0 sealed, 1 out on
+    /// the table with the carton gone. Played backwards when the app closes.
+    pub unbox: f32,
 }
 
 const DISC_TEX_SIZE: u32 = 1024;
+/// Edges are antialiased 4x: the machine's long straight edges stair-step
+/// badly without it.
+const MSAA: u32 = 4;
+/// The sleeve sheet: 284 x 190 mm.
+pub const WRAP_TEX_W: u32 = 2048;
+pub const WRAP_TEX_H: u32 = 1370;
+
+fn smooth(a: f32, b: f32, u: f32) -> f32 {
+    let t = ((u - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Where everything stands `u` of the way through the unboxing.
+#[derive(Clone, Copy, Debug)]
+pub struct CartonPose {
+    /// Lid and dust flaps, radians open.
+    pub lid: f32,
+    pub flaps: f32,
+    /// How high the machine and the carton sit, metres.
+    pub console_y: f32,
+    pub carton_y: f32,
+    /// The machine's pitch about its own middle: -90 degrees while it stands
+    /// on its rear panel the way it is packed, 0 once it has been laid flat.
+    pub tilt: f32,
+    /// How much of the framing is still the carton's (1) rather than the
+    /// machine's alone (0).
+    pub frame: f32,
+}
+
+/// The unboxing, as one curve: the sealed carton holds for a moment, the lid
+/// swings back, the dust flaps fold out, the machine rises straight up out of
+/// its foam still standing on its rear panel with the drawer's face to the
+/// sky, clears the rim, swings down onto its feet and settles on the table as
+/// the carton drops away.
+pub fn carton_pose(u: f32) -> CartonPose {
+    let u = u.clamp(0.0, 1.0);
+    // Straight up first, then the turn, then down onto the table: the phases
+    // barely overlap so each one reads on its own.
+    let rise = smooth(0.56, 0.75, u);
+    let turn = smooth(0.74, 0.90, u);
+    let settle = smooth(0.88, 1.0, u);
+    CartonPose {
+        // The lid hinges along the top of the back wall and stands up and
+        // back; the dust flaps fold straight out, flat.
+        lid: smooth(0.15, 0.42, u) * 160f32.to_radians(),
+        flaps: smooth(0.38, 0.56, u) * 180f32.to_radians(),
+        // The carton stands 290 mm tall and the machine is 272 mm from its
+        // rear edge to its drawer's face, so on edge it only just fits: it
+        // has to come most of its own height up again to clear the rim.
+        console_y: (NEST_Y + (CLEAR_Y - NEST_Y) * rise) * (1.0 - settle),
+        carton_y: -0.9 * smooth(0.80, 0.95, u),
+        tilt: -(1.0 - turn) * std::f32::consts::FRAC_PI_2,
+        frame: 1.0 - smooth(0.74, 0.98, u),
+    }
+}
+
+/// The machine's own middle, measured up from its feet: it pitches about this
+/// point, so the point is what `console_y` places. Half the shell's 86.5 mm,
+/// which also centres the machine's height across the carton's depth when it
+/// stands on its rear edge.
+const PIVOT_Y: f32 = 0.0433;
+/// Where `console_y` sits while the machine is nested in the carton, standing
+/// on its rear edge on the 10 mm foam bed. On edge the machine's rear pods
+/// reach 134 mm below that point and its drawer's buttons stand 135.8 mm
+/// above it, so this rests the pods on the bed — the cable stub's extra 2 mm
+/// denting the foam — with the drawer's face 8 mm under the lid and 10 mm
+/// under the carton's 290 mm rim.
+const NEST_Y: f32 = 0.1007;
+/// And where it sits once the machine is clear of the 290 mm rim: its corner
+/// radius on edge is 143 mm, so the pivot has to pass 433 mm for the swing
+/// down to miss the walls.
+const CLEAR_Y: f32 = 0.42;
+
+type Bounds = ([f32; 3], [f32; 3]);
+
+fn bounds_of(models: &[(&Model, Mat4)]) -> Bounds {
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for (m, at) in models {
+        let place = mat_mul(at, &m.place);
+        for corner in 0..8 {
+            let pick = |bit: usize, axis: usize| {
+                let src = if corner >> bit & 1 == 0 { &m.lo } else { &m.hi };
+                src.get(axis).copied().unwrap_or(0.0)
+            };
+            let p = transform_point(&place, [pick(0, 0), pick(1, 1), pick(2, 2)]);
+            for ((l, h), v) in lo.iter_mut().zip(hi.iter_mut()).zip(p) {
+                *l = l.min(v);
+                *h = h.max(v);
+            }
+        }
+    }
+    (lo, hi)
+}
 
 impl Fz1Renderer {
     pub fn new(state: &egui_wgpu::RenderState, models: &[Model]) -> Option<Self> {
@@ -615,48 +830,48 @@ impl Fz1Renderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: MSAA,
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });
 
-        let disc_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fz1-disc"),
-            size: wgpu::Extent3d {
-                width: DISC_TEX_SIZE,
-                height: DISC_TEX_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        // Clear it to a neutral silver until real label art arrives.
-        state.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &disc_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[0xb0u8, 0xb0, 0xb4, 0xff],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
-        let disc_view = disc_tex.create_view(&Default::default());
+        let upload = |label: &str, w: u32, h: u32, rgba: &[u8]| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            if rgba.len() as u64 == u64::from(w) * u64::from(h) * 4 {
+                write_rgba(&state.queue, &tex, rgba, w, h);
+            }
+            tex
+        };
+        // Game pictures start as neutral grey until the GUI fills them.
+        let slots: Vec<wgpu::Texture> = [ArtSlot::Platter, ArtSlot::Wrap]
+            .iter()
+            .map(|s| {
+                let (w, h) = s.size();
+                let grey: Vec<u8> = std::iter::repeat_n([120u8, 120, 126, 255], (w * h) as usize)
+                    .flatten()
+                    .collect();
+                upload("fz1-slot", w, h, &grey)
+            })
+            .collect();
+        let white = upload("fz1-white", 1, 1, &[255, 255, 255, 255]);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("fz1-disc"),
+            label: Some("fz1"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -664,59 +879,70 @@ impl Fz1Renderer {
             ..Default::default()
         });
 
+        let mut baked = vec![white];
         let mut scene = Vec::new();
         for model in models {
-        let mut parts = Vec::new();
-        for part in &model.parts {
-            let vb = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fz1-vb"),
-                size: (part.verts.len() * 4) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            state.queue.write_buffer(&vb, 0, bytemuck_f32(&part.verts));
-            let ib = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fz1-ib"),
-                size: (part.indices.len() * 4) as u64,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            state
-                .queue
-                .write_buffer(&ib, 0, bytemuck_u32(&part.indices));
-            let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fz1-u"),
-                size: 160, // mvp 64 + model 64 + color 16 + params 16
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fz1"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: ubuf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&disc_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            });
-            parts.push(GpuPart {
-                vb,
-                ib,
-                count: part.indices.len() as u32,
-                ubuf,
-                bind,
-            });
-        }
-        scene.push(parts);
+            let first = baked.len();
+            for (w, h, px) in &model.images {
+                baked.push(upload("fz1-baked", *w, *h, px));
+            }
+            let mut parts = Vec::new();
+            for part in &model.parts {
+                let vb = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fz1-vb"),
+                    size: (part.verts.len() * 4) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                state.queue.write_buffer(&vb, 0, bytemuck_f32(&part.verts));
+                let ib = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fz1-ib"),
+                    size: (part.indices.len() * 4) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                state.queue.write_buffer(&ib, 0, bytemuck_u32(&part.indices));
+                let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fz1-u"),
+                    size: 160, // mvp 64 + model 64 + color 16 + params 16
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let tex = match ArtSlot::of_material(&part.material) {
+                    Some(slot) => slots.get(slot as usize),
+                    None => part
+                        .image
+                        .and_then(|i| baked.get(first + i))
+                        .or_else(|| baked.first()),
+                };
+                let view = tex?.create_view(&Default::default());
+                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("fz1"),
+                    layout: &bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ubuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&sampler),
+                        },
+                    ],
+                });
+                parts.push(GpuPart {
+                    vb,
+                    ib,
+                    count: part.indices.len() as u32,
+                    ubuf,
+                    bind,
+                });
+            }
+            scene.push(parts);
         }
 
         Some(Self {
@@ -724,56 +950,32 @@ impl Fz1Renderer {
             parts: scene,
             targets: Vec::new(),
             points: Vec::new(),
-            disc_tex,
-            disc_view,
-            sampler,
+            slots,
+            _baked: baked,
         })
     }
 
-    /// Upload a new label image for the disc (RGBA, will be centered on a
-    /// DISC_TEX_SIZE canvas letterboxed to a square).
-    /// The label fills the whole disc, so the image has to be exactly the
-    /// disc texture's size: the UVs map 0..1 across it, and anything smaller
-    /// written into a corner shows up as art on a quarter of the disc.
-    pub const ART_SIZE: u32 = DISC_TEX_SIZE;
-
-    pub fn set_disc_art(&mut self, state: &egui_wgpu::RenderState, rgba: &[u8], w: u32, h: u32) {
-        if w != DISC_TEX_SIZE || h != DISC_TEX_SIZE {
+    /// Put a game's picture in a slot. It has to be exactly the slot's size.
+    pub fn set_art(&mut self, state: &egui_wgpu::RenderState, slot: ArtSlot, rgba: &[u8]) {
+        let (w, h) = slot.size();
+        if rgba.len() as u64 != u64::from(w) * u64::from(h) * 4 {
             return;
         }
-        state.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.disc_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w.saturating_mul(4)),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        let _ = &self.disc_view;
-        let _ = &self.sampler;
+        if let Some(tex) = self.slots.get(slot as usize) {
+            write_rgba(&state.queue, tex, rgba, w, h);
+        }
     }
 
-    /// Draw the console into an egui texture and return its id.
-    /// Where each named part's centre lands on the rendered image, in
-    /// 0..1 across it: what the GUI needs to put a click target on a button
-    /// that is being looked at from any angle.
+    /// Where each named part's centre lands on the rendered image, in 0..1
+    /// across it: what the GUI needs to put a click target on a button that
+    /// is being looked at from any angle.
     pub fn screen_points(&self) -> &[(String, [f32; 2], f32)] {
         &self.points
     }
 
-    /// Draw `which` of the scene's models into target `target`, framed on
-    /// just those models.
+    /// Draw `which` of the scene's models into target `target`. Target 0 is
+    /// the machine's view, framed on the machine (and on the carton while it
+    /// is there); any other target is the case view.
     pub fn render_into(
         &mut self,
         state: &egui_wgpu::RenderState,
@@ -787,52 +989,56 @@ impl Fz1Renderer {
         while self.targets.len() <= target {
             self.targets.push(Target::default());
         }
-        let models: Vec<&Model> = which.clone().filter_map(|i| models.get(i)).collect();
-        if models.is_empty() {
-            return None;
-        }
-        // The console leads: the camera frames it, and the rest of the scene
-        // is placed around it.
-        let model = models.first()?;
+        let first = which.start;
+        let models: Vec<&Model> = which.filter_map(|i| models.get(i)).collect();
+        let model = *models.first()?;
         let device = &state.device;
         if w == 0 || h == 0 || w > 4096 || h > 4096 {
             return None;
         }
         let slot = self.targets.get(target)?;
         if slot.w != w || slot.h != h || slot.color.is_none() {
-            let color = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("fz1-out"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let depth = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("fz1-depth"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Depth24Plus,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            });
+            let make = |label, format, usage, samples| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: samples,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+            };
+            let color = make(
+                "fz1-out",
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                1,
+            );
+            let msaa = make(
+                "fz1-msaa",
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                MSAA,
+            );
+            let depth = make(
+                "fz1-depth",
+                wgpu::TextureFormat::Depth24Plus,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                MSAA,
+            );
             let color_view = color.create_view(&Default::default());
             let depth_view = depth.create_view(&Default::default());
             if let Some(slot) = self.targets.get_mut(target) {
                 slot.color = Some((color, color_view));
+                slot.msaa = Some(msaa.create_view(&Default::default()));
                 slot.depth = Some((depth, depth_view));
                 slot.w = w;
                 slot.h = h;
@@ -841,67 +1047,80 @@ impl Fz1Renderer {
         let slot = self.targets.get(target)?;
         let (_, color_view) = slot.color.as_ref()?;
         let (_, depth_view) = slot.depth.as_ref()?;
+        let msaa_view = slot.msaa.as_ref()?;
 
-        // Camera: orbiting the whole scene — the machine, its shelf and the
-        // pads in front of it — so nothing is framed out.
-        let mut lo = [f32::MAX; 3];
-        let mut hi = [f32::MIN; 3];
-        for scene_model in models.iter() {
-            let placed = transform_point(&scene_model.place, scene_model.center);
-            let reach = scene_model.radius * scene_place_scale(&scene_model.place);
-            for axis in 0..3 {
-                if let (Some(v), Some(l), Some(h)) =
-                    (placed.get(axis), lo.get_mut(axis), hi.get_mut(axis))
-                {
-                    *l = l.min(*v - reach);
-                    *h = h.max(*v + reach);
+        // Where each model stands this frame: the unboxing moves the machine
+        // and the carton as a whole.
+        let pose = carton_pose(anim.unbox);
+        let unboxing = anim.unbox < 0.999;
+        let lift = |m: &Model| match m.kind {
+            // The machine rides up on edge and pitches about its own middle,
+            // so the turn is a rotation around a point PIVOT_Y above its feet.
+            Kind::Console if unboxing => mat_mul(
+                &mat_translate([0.0, pose.console_y + PIVOT_Y, 0.0]),
+                &mat_mul(&mat_rot_x(pose.tilt), &mat_translate([0.0, -PIVOT_Y, 0.0])),
+            ),
+            Kind::Carton => mat_translate([0.0, pose.carton_y, 0.0]),
+            _ => mat_identity(),
+        };
+
+        // Framing: the machine alone, or — while the carton is on show — the
+        // carton around it, blended so the camera eases from one to the other.
+        let own_view = target == 0;
+        let (lo, hi) = {
+            // Each view frames what it shows: the machine view frames the
+            // machine, the case view the case alone.
+            let lead: Vec<(&Model, Mat4)> = models
+                .iter()
+                .filter(|m| matches!((own_view, m.kind), (true, Kind::Console) | (false, Kind::Case)))
+                .map(|m| (*m, lift(m)))
+                .collect();
+            let (mut lo, mut hi) = bounds_of(&lead);
+            let carton: Vec<(&Model, Mat4)> = models
+                .iter()
+                .filter(|m| m.kind == Kind::Carton)
+                .map(|m| (*m, mat_identity()))
+                .collect();
+            if !carton.is_empty() && pose.frame > 0.0 {
+                let (clo, chi) = bounds_of(&carton);
+                for (l, cl) in lo.iter_mut().zip(clo) {
+                    *l += (cl.min(*l) - *l) * pose.frame;
+                }
+                for (h, ch) in hi.iter_mut().zip(chi) {
+                    *h += (ch.max(*h) - *h) * pose.frame;
                 }
             }
-        }
-        let mut c = [0.0f32; 3];
-        for axis in 0..3 {
-            if let (Some(l), Some(h), Some(slot)) = (lo.get(axis), hi.get(axis), c.get_mut(axis)) {
-                *slot = (l + h) * 0.5;
-            }
-        }
-        let r = (0..3)
-            .filter_map(|axis| Some((hi.get(axis)? - lo.get(axis)?) * 0.5))
-            .fold(0.05f32, f32::max);
-        let _ = model;
-        let own_view = target == 0;
-        let pitch = if own_view {
-            anim.pitch.clamp(-1.3, 1.3)
-        } else {
-            // Nearly overhead by default: a pad on the table reads face up.
-            anim.pad_pitch.clamp(0.15, 1.5)
+            (lo, hi)
         };
-        // Far enough back that the whole unit sits in the frame, and wider
-        // still when the viewport is tall and narrow.
-        let aspect = (w as f32 / h as f32).max(0.2);
-        let zoom = if own_view {
-            anim.zoom.clamp(0.45, 3.0).max(0.05)
-        } else {
-            0.95
-        };
-        // Far enough that the whole thing fits the view it is given, across
-        // as well as down — a fudge factor crops a wide box. The drawer
-        // slides toward the viewer, so the view opens out with it as well.
-        let open = if own_view { anim.tray.clamp(0.0, 1.0) } else { 0.0 };
+        let c = [
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        ];
         let half = |axis: usize| {
             (hi.get(axis).copied().unwrap_or(0.0) - lo.get(axis).copied().unwrap_or(0.0)) * 0.5
         };
-        let tan = (38f32.to_radians() * 0.5).tan().max(1e-3);
-        let by_height = half(1) / tan;
-        let by_width = half(0).max(half(2)) / (tan * aspect);
-        let dist = (by_height.max(by_width) + half(2)) * 1.12 * zoom * (1.0 + 0.25 * open);
-        let _ = r;
-        let (sy, cy) = if own_view {
-            anim.yaw.sin_cos()
+        let r = half(0).max(half(1)).max(half(2)).max(0.05);
+        let (yaw, pitch, zoom) = if own_view {
+            (anim.yaw, anim.pitch.clamp(-1.3, 1.3), anim.zoom.clamp(0.45, 3.0))
         } else {
-            // Square on: a pad sits across its view, the way it sits in two
-            // hands.
-            anim.pad_yaw.sin_cos()
+            (
+                anim.case_yaw,
+                anim.case_pitch.clamp(-1.4, 1.4),
+                anim.case_zoom.clamp(0.5, 2.5),
+            )
         };
+        let aspect = (w as f32 / h as f32).max(0.2);
+        // Far enough that the whole thing fits the view it is given, across
+        // as well as down. The drawer slides toward the viewer, so the view
+        // opens out with it.
+        let open = if own_view && !unboxing { anim.tray.clamp(0.0, 1.0) } else { 0.0 };
+        // The box's bounding sphere fits the narrower of the two fields of
+        // view, whichever way round it is turned.
+        let tan = (38f32.to_radians() * 0.5).tan().max(1e-3) * aspect.min(1.0);
+        let sphere = (half(0).powi(2) + half(1).powi(2) + half(2).powi(2)).sqrt();
+        let dist = sphere / tan * 0.92 * zoom * (1.0 + 0.24 * open);
+        let (sy, cy) = yaw.sin_cos();
         let (sp, cp) = pitch.sin_cos();
         let eye = [
             c[0] + dist * cp * sy,
@@ -912,23 +1131,60 @@ impl Fz1Renderer {
         // and the disc on it sit in the middle of the picture.
         let aim = [c[0], c[1] - r * 0.1 * open, c[2] + r * 0.22 * open];
         let view = mat_look_at(eye, aim, [0.0, 1.0, 0.0]);
-        let proj = mat_perspective(38f32.to_radians(), aspect, 0.01, 10.0);
+        let proj = mat_perspective(38f32.to_radians(), aspect, 0.01, 20.0);
         let vp = mat_mul(&proj, &view);
 
         // The tray slides along the animation channel.
-        let tray_t = anim.tray.clamp(0.0, 1.0);
-        let tray_pos = if model.tray_anim.is_empty() {
-            // No clip: fake it by sliding forward in local Z.
+        // A machine still in its carton has its drawer shut, whatever the
+        // launcher would otherwise be asking for.
+        let tray_t = if unboxing { 0.0 } else { anim.tray.clamp(0.0, 1.0) };
+        let tray_pos = {
             let rest = model.tray_rest.unwrap_or([0.0; 3]);
-            [rest[0], rest[1], rest[2] + tray_t * 0.13]
-        } else {
-            let span = model
+            // The clip says which way the drawer runs; TRAY_TRAVEL says how
+            // far, so the tray comes fully clear of the case whatever the
+            // asset's own clip was authored at.
+            let end = model
                 .tray_anim
                 .last()
-                .map(|l| l.0)
-                .unwrap_or(1.0)
-                .max(0.001);
-            model.tray_at(tray_t * span)
+                .map(|l| l.1)
+                .unwrap_or([rest[0], rest[1], rest[2] + 1.0]);
+            let d = [end[0] - rest[0], end[1] - rest[1], end[2] - rest[2]];
+            let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+            let s = tray_t * TRAY_TRAVEL / n;
+            [rest[0] + d[0] * s, rest[1] + d[1] * s, rest[2] + d[2] * s]
+        };
+
+        // Every part's world transform, worked out once for drawing and for
+        // the click targets.
+        let world_of = |m: &Model, part: &Part| -> Option<Mat4> {
+            let base = mat_mul(&lift(m), &m.place);
+            let mut world = mat_mul(&base, &mat_mul(&part.parent, &part.local));
+            match (m.kind, part.name.as_str()) {
+                (Kind::Console, "FZ1_Tray" | "Disc") => {
+                    let rest = m.tray_rest.unwrap_or(tray_pos);
+                    let slide = mat_translate([
+                        tray_pos[0] - rest[0],
+                        tray_pos[1] - rest[1],
+                        tray_pos[2] - rest[2],
+                    ]);
+                    world = mat_mul(&base, &mat_mul(&slide, &mat_mul(&part.parent, &part.local)));
+                    if part.name == "Disc" {
+                        if !anim.disc_shown {
+                            return None;
+                        }
+                        // Coming down onto the spindle as it is put in.
+                        let drop = 1.0 - anim.disc_drop.clamp(0.0, 1.0);
+                        world = mat_mul(&mat_translate([0.0, drop * 0.09, 0.0]), &world);
+                        world = mat_mul(&world, &mat_rot_y(anim.spin));
+                    }
+                }
+                (Kind::Carton, _) if !unboxing => return None,
+                (Kind::Carton, "BoxLid") => world = mat_mul(&world, &mat_rot_x(-pose.lid)),
+                (Kind::Carton, "FlapLeft") => world = mat_mul(&world, &mat_rot_z(pose.flaps)),
+                (Kind::Carton, "FlapRight") => world = mat_mul(&world, &mat_rot_z(-pose.flaps)),
+                _ => {}
+            }
+            Some(world)
         };
 
         let mut encoder =
@@ -937,14 +1193,13 @@ impl Fz1Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fz1"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
+                    view: msaa_view,
+                    resolve_target: Some(color_view),
                     ops: wgpu::Operations {
-                        // Clear transparent, not to a page grey: the GUI's
-                        // own wallpaper shows through wherever the machine
-                        // isn't drawn.
+                        // Clear transparent: the GUI's own backdrop shows
+                        // through wherever nothing is drawn.
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     },
                     depth_slice: None,
                 })],
@@ -952,7 +1207,7 @@ impl Fz1Renderer {
                     view: depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
                 }),
@@ -961,94 +1216,83 @@ impl Fz1Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            for (gpu_parts, model) in self.parts.iter().skip(which.start).zip(models.iter()) {
-            for (gpu, part) in gpu_parts.iter().zip(model.parts.iter()) {
-                // Dynamic transforms: tray children slide with the drawer,
-                // the disc additionally spins about its own local Z.
-                let delta = [
-                    tray_pos[0] - model.tray_rest.unwrap_or(tray_pos)[0],
-                    tray_pos[1] - model.tray_rest.unwrap_or(tray_pos)[1],
-                    tray_pos[2] - model.tray_rest.unwrap_or(tray_pos)[2],
-                ];
-                let slide = mat_translate(delta);
-                let mut world =
-                    mat_mul(&model.place, &mat_mul(&slide, &mat_mul(&part.parent, &part.local)));
-                let is_tray_child = part.name == "FZ1_Tray" || part.name == "Disc";
-                if !is_tray_child {
-                    world = mat_mul(&model.place, &mat_mul(&part.parent, &part.local));
-                }
-                if part.name == "Disc" {
-                    world = mat_mul(&world, &mat_rot_y(anim.spin));
-                }
-                let mvp = mat_mul(&vp, &world);
-                // The lamps are driven by name: READY holds while the
-                // machine is powered, ACCESS follows the level the GUI
-                // sets, and the little face lenses the GLB carries stay
-                // dark — on this front the light lives behind the strips.
-                let gain = match part.name.as_str() {
-                    "ReadyLamp" | "AccessLamp" => 0.0,
-                    "ReadyGlow" => {
-                        if anim.lit {
-                            2.0
+            for (gpu_parts, m) in self.parts.iter().skip(first).zip(models.iter()) {
+                for (gpu, part) in gpu_parts.iter().zip(m.parts.iter()) {
+                    let Some(world) = world_of(m, part) else {
+                        continue;
+                    };
+                    let mvp = mat_mul(&vp, &world);
+                    // The lamps are driven by name: READY holds while the
+                    // machine is powered, ACCESS follows the level the GUI
+                    // sets.
+                    let gain = match part.name.as_str() {
+                        "ReadyGlow" => {
+                            if anim.lit {
+                                2.0
+                            } else {
+                                0.0
+                            }
+                        }
+                        "AccessGlow" => anim.access.clamp(0.0, 1.0) * 3.0,
+                        _ => 0.0,
+                    };
+                    let params = [
+                        if part.textured || ArtSlot::of_material(&part.material).is_some() {
+                            1.0
                         } else {
                             0.0
-                        }
-                    }
-                    "AccessGlow" => anim.access.clamp(0.0, 1.0) * 3.0,
-                    _ => {
-                        if anim.lit {
-                            1.5
+                        },
+                        if part.emissive.iter().any(|e| *e > 0.01) {
+                            gain
                         } else {
                             0.0
-                        }
-                    }
-                };
-                let params = [
-                    if part.textured { 1.0 } else { 0.0 },
-                    if part.emissive.iter().any(|e| *e > 0.01) {
-                        gain
+                        },
+                        if m.kind == Kind::Case { 1.0 } else { 0.0 },
+                        0.0,
+                    ];
+                    // A lit lamp shows its own colour, not the dark lens.
+                    let color = if params[1] > 0.0 {
+                        [part.emissive[0], part.emissive[1], part.emissive[2], 1.0]
                     } else {
-                        0.0
-                    },
-                    0.0,
-                    0.0,
-                ];
-                let mut udata = Vec::with_capacity(160);
-                udata.extend_from_slice(bytemuck_f32(mvp.as_flattened()));
-                udata.extend_from_slice(bytemuck_f32(world.as_flattened()));
-                udata.extend_from_slice(bytemuck_f32(&part.color));
-                udata.extend_from_slice(bytemuck_f32(&params));
-                state.queue.write_buffer(&gpu.ubuf, 0, &udata);
-                pass.set_vertex_buffer(0, gpu.vb.slice(..));
-                pass.set_index_buffer(gpu.ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.set_bind_group(0, &gpu.bind, &[]);
-                pass.draw_indexed(0..gpu.count, 0, 0..1);
-            }
+                        part.color
+                    };
+                    let mut udata = Vec::with_capacity(160);
+                    udata.extend_from_slice(bytemuck_f32(mvp.as_flattened()));
+                    udata.extend_from_slice(bytemuck_f32(world.as_flattened()));
+                    udata.extend_from_slice(bytemuck_f32(&color));
+                    udata.extend_from_slice(bytemuck_f32(&params));
+                    state.queue.write_buffer(&gpu.ubuf, 0, &udata);
+                    pass.set_vertex_buffer(0, gpu.vb.slice(..));
+                    pass.set_index_buffer(gpu.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_bind_group(0, &gpu.bind, &[]);
+                    pass.draw_indexed(0..gpu.count, 0, 0..1);
+                }
             }
         }
         // Remember where each part landed, for the caller's click targets.
         self.points.clear();
-        for model in models.iter() {
-        for part in &model.parts {
-            let world = mat_mul(&model.place, &mat_mul(&part.parent, &part.local));
-            let centre = transform_point(&world, part.centre);
-            let clip = transform_clip(&vp, centre);
-            if clip[3] <= 0.0 {
-                continue;
+        for m in models.iter() {
+            for part in &m.parts {
+                let Some(world) = world_of(m, part) else {
+                    continue;
+                };
+                let centre = transform_point(&world, part.centre);
+                let clip = transform_clip(&vp, centre);
+                if clip[3] <= 0.0 {
+                    continue;
+                }
+                let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+                self.points.push((
+                    part.name.clone(),
+                    [(ndc[0] + 1.0) * 0.5, (1.0 - ndc[1]) * 0.5],
+                    ndc[2],
+                ));
             }
-            let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
-            self.points.push((
-                part.name.clone(),
-                [(ndc[0] + 1.0) * 0.5, (1.0 - ndc[1]) * 0.5],
-                ndc[2],
-            ));
-        }
         }
         state.queue.submit([encoder.finish()]);
 
         let mut renderer = state.renderer.write();
-        let existing = self.targets.get(target).and_then(|t| t.tex_id);
-        match existing {
+        match self.targets.get(target).and_then(|t| t.tex_id) {
             Some(id) => {
                 renderer.update_egui_texture_from_wgpu_texture(
                     device,
@@ -1068,6 +1312,46 @@ impl Fz1Renderer {
             }
         }
     }
+
+    /// The colour texture a target was last drawn into (the offscreen
+    /// checks in examples/ read it back).
+    #[allow(dead_code)]
+    pub fn target_texture(&self, target: usize) -> Option<&wgpu::Texture> {
+        self.targets.get(target)?.color.as_ref().map(|(t, _)| t)
+    }
+
+    /// Let go of the egui textures the targets registered, before the
+    /// renderer is dropped, so a suspended scene leaves nothing behind.
+    pub fn release(&mut self, state: &egui_wgpu::RenderState) {
+        let mut renderer = state.renderer.write();
+        for t in self.targets.drain(..) {
+            if let Some(id) = t.tex_id {
+                renderer.free_texture(&id);
+            }
+        }
+    }
+}
+
+fn write_rgba(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8], w: u32, h: u32) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w.saturating_mul(4)),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 fn bytemuck_f32(v: &[f32]) -> &[u8] {

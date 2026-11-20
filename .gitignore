@@ -9,3 +9,6 @@ usage.json
 checks/
 capture/
 app/shots/
+android/target/
+android/build/
+android/keystore/

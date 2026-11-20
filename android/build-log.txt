@@ -1,0 +1,35 @@
+    Building arm64-v8a (aarch64-linux-android)
+   Compiling retro3do-android v0.1.0 (/home/jon/retro3do-rs/android)
+warning: constant `AUDIO_PAIRS_TARGET` is never used
+  --> src/../../app/src/bin/retro3do-gui.rs:42:7
+   |
+42 | const AUDIO_PAIRS_TARGET: i32 = 2048;
+   |       ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `AUDIO_BYTES_PER_PAIR` is never used
+  --> src/../../app/src/bin/retro3do-gui.rs:44:7
+   |
+44 | const AUDIO_BYTES_PER_PAIR: i32 = 4;
+   |       ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `main` is never used
+    --> src/../../app/src/bin/retro3do-gui.rs:2621:4
+     |
+2621 | fn main() -> Result<(), Box<dyn std::error::Error>> {
+     |    ^^^^
+
+warning: `extern` fn uses type `AndroidApp`, which is not FFI-safe
+  --> src/lib.rs:15:37
+   |
+15 | pub extern "C" fn android_main(app: winit::platform::android::activity::AndroidApp) {
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not FFI-safe
+   |
+   = help: consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct
+   = note: this struct has unspecified layout
+   = note: `#[warn(improper_ctypes_definitions)]` on by default
+
+warning: `retro3do-android` (lib) generated 4 warnings
+    Finished `release` profile [optimized] target(s) in 26.05s
+     Copying libraries to /home/jon/retro3do-rs/android/build/jniLibs

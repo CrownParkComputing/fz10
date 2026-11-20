@@ -1464,13 +1464,26 @@ impl Arm60 {
             self.switch_mode(Mode::User.bits());
         }
 
-        let registers = (0u8..16).map(Reg).filter(|reg| t.list & (1 << reg.0) != 0);
+        // The registers in the list, in order. Walking the list's bits beats
+        // testing all sixteen: a transfer names a handful of them.
+        let mut list = [Reg(0); 16];
+        let mut list_len = 0usize;
+        let mut bits = t.list;
+        while bits != 0 {
+            let bit = bits.trailing_zeros();
+            bits &= bits - 1;
+            if let Some(slot) = list.get_mut(list_len) {
+                *slot = Reg(bit as u8);
+            }
+            list_len += 1;
+        }
+        let registers = list.get(..list_len).unwrap_or(&[]);
         if t.load {
             // Write-back first, so a base also in the list ends up loaded.
             if t.write_back {
                 self.set_r(t.rn, final_base);
             }
-            for reg in registers {
+            for &reg in registers {
                 let value = bus.read32(address);
                 self.write_dest(reg, value);
                 address = address.wrapping_add(4);
@@ -1481,7 +1494,7 @@ impl Arm60 {
                 self.set_cpsr(spsr);
             }
         } else {
-            for reg in registers {
+            for &reg in registers {
                 let value = self.r_plus12(reg);
                 bus.write32(address, value);
                 address = address.wrapping_add(4);
