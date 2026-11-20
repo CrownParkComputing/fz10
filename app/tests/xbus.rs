@@ -478,3 +478,18 @@ fn the_drive_and_its_disc_can_move_to_the_emulator_thread() {
     assert_send::<CdRomDevice>();
     assert_send::<Disc>();
 }
+
+#[test]
+fn a_reset_does_not_swallow_a_disc_the_bios_has_not_been_told_about() {
+    // The launcher puts the disc in and then powers the machine on, which
+    // resets it. The media change belongs to the drive, not to the machine:
+    // if the reset eats it, the BIOS never looks at the disc and the
+    // machine asks for a CD that is already in the drive.
+    let mut drive = CdRomDevice::new();
+    drive.set_disc_present(true);
+    drive.reset();
+    assert!(
+        drive.take_media_changed(),
+        "the reset ate the media change"
+    );
+}

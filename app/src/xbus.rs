@@ -379,8 +379,11 @@ impl CdRomDevice {
     pub fn reset(&mut self) {
         self.status.clear();
         self.pending.clear();
-        self.media_changed = false;
-        self.interrupt_request = false;
+        // The media change and the request that carries it belong to the
+        // drive, not to the machine: a reset must not swallow a disc the BIOS
+        // has not been told about yet, or the machine asks for a CD that is
+        // already in the drive. Reading the status clears both, so leaving
+        // them alone here keeps a pending change pending.
         self.motor_on = false;
         self.tray_open = false;
         self.last_error = 0;
