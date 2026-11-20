@@ -19,6 +19,12 @@ mod boot_logo;
 mod fz1_3d;
 #[path = "retro3do-gui/gpu_scale.rs"]
 mod gpu_scale;
+#[cfg(target_os = "android")]
+#[path = "retro3do-gui/android_pad.rs"]
+mod android_pad;
+#[cfg(not(target_os = "android"))]
+#[path = "retro3do-gui/sdl_pad.rs"]
+mod sdl_pad;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,15 +33,17 @@ use std::time::{Duration, Instant};
 
 use egui::{ColorImage, StrokeKind, TextureHandle, TextureOptions};
 use retro3do::{PadButton, Region, Retro3do, MAX_PADS};
+#[cfg(not(target_os = "android"))]
 use sdl3::audio::{AudioFormat, AudioSpec, AudioStreamOwner};
-use sdl3::gamepad::{Axis, Button, Gamepad};
 
 const TILE_W: f32 = 190.0;
 const TILE_H: f32 = 108.0;
 
 /// Audio the stream keeps buffered, and how much is pulled at a time.
+#[cfg(not(target_os = "android"))]
 const AUDIO_PAIRS_TARGET: i32 = 2048;
 const AUDIO_PAIRS_PULL: usize = 1024;
+#[cfg(not(target_os = "android"))]
 const AUDIO_BYTES_PER_PAIR: i32 = 4;
 
 /// What the core is asked to draw at when its art is being read. It is a ceiling,
@@ -90,10 +98,73 @@ struct Config {
     texdir: Option<PathBuf>,
 }
 
+/// Shared, user-visible storage on Android: a folder a person can fill from a
+/// file manager, a card reader or `adb push`. Writability needs "All files
+/// access" (MANAGE_EXTERNAL_STORAGE, in the manifest).
+#[cfg(target_os = "android")]
+const ANDROID_STORAGE: &str = "/sdcard/fz10";
+
+/// What Android lets an app write with no permission at all, used when the
+/// shared folder above is not writable (the permission was not granted).
+#[cfg(target_os = "android")]
+const ANDROID_APP_STORAGE: &str =
+    "/storage/emulated/0/Android/data/com.crownpark.fz10/files/fz10";
+
+/// The folder the launcher's own files live in: the shared one on Android,
+/// `~/.config/retro3do` elsewhere.
+fn config_dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        let shared = PathBuf::from(ANDROID_STORAGE);
+        if std::fs::create_dir_all(&shared).is_ok() {
+            return shared;
+        }
+        let own = PathBuf::from(ANDROID_APP_STORAGE);
+        let _ = std::fs::create_dir_all(&own);
+        own
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(format!("{home}/.config/retro3do"))
+    }
+}
+
 /// Where the launcher remembers its paths between runs.
 fn settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(format!("{home}/.config/retro3do/launcher.conf"))
+    config_dir().join("launcher.conf")
+}
+
+/// The defaults for the folders a person fills: on Android everything sits
+/// under one shared folder, so the walkthrough can point at it and be done.
+fn default_dirs() -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    #[cfg(target_os = "android")]
+    {
+        let root = config_dir();
+        (
+            root.join("games"),
+            root.join("media"),
+            root.join("bios"),
+            root.join("saves"),
+            root.join("docs"),
+        )
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        (
+            PathBuf::from(format!("{home}/3do-library/games")),
+            PathBuf::from(format!("{home}/StudioProjects/RetroMedia/media/3do")),
+            PathBuf::from(format!("{home}/3do-library/bios")),
+            PathBuf::from(format!("{home}/3do-library/saves")),
+            PathBuf::from(format!("{home}/3do-library/docs")),
+        )
+    }
+}
+
+/// Where a folder picker starts when a field is empty.
+fn start_dir() -> PathBuf {
+    config_dir()
 }
 
 impl Config {
@@ -139,20 +210,24 @@ impl Config {
         std::fs::write(&path, text).map_err(|e| e.to_string())
     }
 
-    fn from_args() -> Result<Self, String> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let mut cfg = Config {
-            games_dir: PathBuf::from(format!("{home}/3do-library/games")),
-            media_dir: PathBuf::from(format!("{home}/StudioProjects/RetroMedia/media/3do")),
-            bios_dir: PathBuf::from(format!("{home}/3do-library/bios")),
-            saves_dir: PathBuf::from(format!("{home}/3do-library/saves")),
+    fn with_defaults() -> Self {
+        let (games_dir, media_dir, bios_dir, saves_dir, docs_dir) = default_dirs();
+        Config {
+            games_dir,
+            media_dir,
+            bios_dir,
+            saves_dir,
             boot: None,
             play: None,
-            docs_dir: PathBuf::from(format!("{home}/3do-library/docs")),
+            docs_dir,
             bios_choice: None,
             configured: false,
             texdir: std::env::var_os("RETRO3DO_TEXDIR").map(PathBuf::from),
-        };
+        }
+    }
+
+    fn from_args() -> Result<Self, String> {
+        let mut cfg = Self::with_defaults();
         // Remembered paths first; anything on the command line wins.
         let configured = cfg.load_settings();
         cfg.configured = configured;
@@ -483,14 +558,20 @@ fn bios_candidates(dir: &Path) -> Vec<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// SDL3: audio device stream and gamepads (no video — egui owns the window)
+// Audio device stream and gamepads (no video — egui owns the window).
+//
+// Desktop builds take both from SDL3. Android builds take pads from the Java
+// shim in `android/` (Android key/generic-motion events, see android_pad.rs)
+// and have no audio device yet, so the ring is drained and dropped.
 
+#[cfg(not(target_os = "android"))]
 struct SoundAndPads {
     _sdl: sdl3::Sdl,
     stream: Option<AudioStreamOwner>,
-    pads: Vec<Gamepad>,
+    gamepads: Option<sdl_pad::Gamepads>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl SoundAndPads {
     fn open() -> Option<Self> {
         let sdl = sdl3::init().ok()?;
@@ -508,23 +589,14 @@ impl SoundAndPads {
         if let Some(s) = &stream {
             let _ = s.resume();
         }
-        let gamepad = sdl.gamepad().ok();
-        let mut pads = Vec::new();
-        if let Some(g) = &gamepad {
-            if let Ok(ids) = g.gamepads() {
-                for id in ids.into_iter().take(MAX_PADS as usize - 1) {
-                    if g.is_gamepad(id) {
-                        if let Ok(p) = g.open(id) {
-                            pads.push(p);
-                        }
-                    }
-                }
-            }
-        }
+        // The gamepad module opens the pads SDL reports and keeps up with pads
+        // plugged in later; egui owns the window, so there is no SDL event loop
+        // here to poll them with.
+        let gamepads = sdl.gamepad().ok().map(sdl_pad::Gamepads::new);
         Some(SoundAndPads {
             _sdl: sdl,
             stream,
-            pads,
+            gamepads,
         })
     }
 
@@ -542,54 +614,73 @@ impl SoundAndPads {
         }
     }
 
-    /// Pads after the keyboard: SDL pad i is console pad i+1.
+    /// The 3DO buttons held down on gamepad `index`.
     fn pad_mask(&self, index: usize) -> u32 {
-        let mut mask = 0u32;
-        if let Some(p) = self.pads.get(index) {
-            for (button, pad) in [
-                (Button::DPadUp, PadButton::Up),
-                (Button::DPadDown, PadButton::Down),
-                (Button::DPadLeft, PadButton::Left),
-                (Button::DPadRight, PadButton::Right),
-                (Button::South, PadButton::A),
-                (Button::East, PadButton::B),
-                (Button::West, PadButton::C),
-                (Button::North, PadButton::C),
-                (Button::Start, PadButton::Play),
-                (Button::Back, PadButton::Stop),
-                (Button::LeftShoulder, PadButton::LeftShift),
-                (Button::RightShoulder, PadButton::RightShift),
-            ] {
-                if p.button(button) {
-                    mask |= 1 << (pad as u32);
-                }
-            }
-            const EDGE: i16 = 16000;
-            if p.axis(Axis::LeftX) < -EDGE {
-                mask |= 1 << (PadButton::Left as u32);
-            }
-            if p.axis(Axis::LeftX) > EDGE {
-                mask |= 1 << (PadButton::Right as u32);
-            }
-            if p.axis(Axis::LeftY) < -EDGE {
-                mask |= 1 << (PadButton::Up as u32);
-            }
-            if p.axis(Axis::LeftY) > EDGE {
-                mask |= 1 << (PadButton::Down as u32);
-            }
-            if p.axis(Axis::TriggerLeft) > EDGE {
-                mask |= 1 << (PadButton::LeftShift as u32);
-            }
-            if p.axis(Axis::TriggerRight) > EDGE {
-                mask |= 1 << (PadButton::RightShift as u32);
-            }
-        }
-        mask
+        self.gamepads.as_ref().map_or(0, |g| g.mask(index))
     }
 
     fn count(&self) -> usize {
-        self.pads.len()
+        self.gamepads.as_ref().map_or(0, |g| g.count())
     }
+
+    /// The names SDL reports, for the launcher's status line.
+    fn names(&self) -> Vec<String> {
+        self.gamepads.as_ref().map_or_else(Vec::new, |g| g.names())
+    }
+
+    /// Looks for pads plugged in or pulled out since the last look.
+    fn refresh(&mut self) {
+        if let Some(g) = self.gamepads.as_mut() {
+            g.refresh();
+        }
+    }
+}
+
+/// Android pads: one physical gamepad, mapped onto console pad 0 beside the
+/// keyboard, delivered by the Java shim (see `android_pad.rs`).
+#[cfg(target_os = "android")]
+struct SoundAndPads;
+
+#[cfg(target_os = "android")]
+impl SoundAndPads {
+    fn open() -> Option<Self> {
+        Some(SoundAndPads)
+    }
+
+    /// No audio device on Android yet: the ring is drained so it never holds
+    /// stale samples, and nothing is played.
+    fn top_up(&self, emu: &Retro3do, buf: &mut [i16]) {
+        let _ = emu.audio().pull_interleaved(buf);
+    }
+
+    fn pad_mask(&self, index: usize) -> u32 {
+        android_pad::pad_mask(index)
+    }
+
+    fn count(&self) -> usize {
+        0
+    }
+
+    /// Android pads have no name to report.
+    fn names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The Java shim delivers Android pads as they happen, so there is
+    /// nothing to look for here.
+    fn refresh(&mut self) {}
+}
+
+/// The JNI shim in `android/src/lib.rs` hands the activity's key events here.
+#[cfg(target_os = "android")]
+pub fn android_pad_key(code: i32, down: bool) {
+    android_pad::set_key(code, down);
+}
+
+/// ...and its generic motion events (sticks, d-pad hat, triggers).
+#[cfg(target_os = "android")]
+pub fn android_pad_axis(axis: i32, value: f32) {
+    android_pad::set_axis(axis, value);
 }
 
 fn keyboard_mask(ctx: &egui::Context) -> u32 {
@@ -741,6 +832,11 @@ impl GuiApp {
         visuals.panel_fill = BG;
         visuals.window_fill = PANEL;
         cc.egui_ctx.set_visuals(visuals);
+        // A handheld's 1080p landscape is dense in logical pixels; scale the
+        // whole launcher up so tiles and text stay thumb-sized.
+        #[cfg(target_os = "android")]
+        cc.egui_ctx.set_pixels_per_point(1.75);
+        #[cfg(not(target_os = "android"))]
         cc.egui_ctx.set_pixels_per_point(1.0);
 
         let games = scan_games(&cfg);
@@ -1086,18 +1182,24 @@ impl GuiApp {
         self.view = View::Machine;
     }
 
-    fn push_pads(&self, ctx: &egui::Context) {
+    /// The gamepads SDL reports, for the launcher's status line.
+    fn pad_names(&self) -> Vec<String> {
+        self.io.as_ref().map_or_else(Vec::new, |io| io.names())
+    }
+
+    fn push_pads(&mut self, ctx: &egui::Context) {
         let mut connected = 0u32;
-        // Pad 0 is the keyboard plus SDL pad 0 so a gamepad always works even
-        // without mapping keys. Extra SDL pads chain behind.
+        // Console pad 0 is the keyboard plus the first gamepad, so a gamepad
+        // always works even without mapping keys. Extra gamepads chain behind.
         let keys = keyboard_mask(ctx);
         let mut mask = keys;
-        if let Some(io) = &self.io {
+        if let Some(io) = self.io.as_mut() {
+            io.refresh();
             mask |= io.pad_mask(0);
-            for i in 0..io.count() {
-                let idx = (i + 1) as u32;
+            for i in 1..io.count() {
+                let idx = i as u32;
                 if idx < MAX_PADS {
-                    self.emu.pads().set_buttons(idx, io.pad_mask(i + 1));
+                    self.emu.pads().set_buttons(idx, io.pad_mask(i));
                     self.emu.pads().set_connected(idx, true);
                     connected = idx + 1;
                 }
@@ -1125,11 +1227,11 @@ impl GuiApp {
             ui.add(egui::TextEdit::singleline(field).desired_width(340.0));
             if ui.button("browse…").clicked() {
                 let start = field.trim();
-                let start = PathBuf::from(if start.is_empty() {
-                    std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+                let start = if start.is_empty() {
+                    start_dir()
                 } else {
-                    start.to_string()
-                });
+                    PathBuf::from(start)
+                };
                 self.picker = Some(if start.is_dir() {
                     start
                 } else {
@@ -1693,9 +1795,16 @@ impl GuiApp {
     }
 
     fn toggle_tray(&mut self) {
+        eprintln!("[DEBUG] toggle_tray: current open={}", self.fz1_tray_open);
         self.fz1_tray_open = !self.fz1_tray_open;
+        eprintln!("[DEBUG] toggle_tray: new open={}", self.fz1_tray_open);
         if !self.fz1_tray_open {
             self.pending_start = self.selected_game();
+            eprintln!("[DEBUG] toggle_tray: pending_start set to {:?}", self.pending_start);
+        } else {
+            // When opening the tray, stop disc spin
+            self.disc_angle = 0.0;
+            eprintln!("[DEBUG] toggle_tray: disc_angle reset due to open tray");
         }
     }
 
@@ -1964,7 +2073,7 @@ impl eframe::App for GuiApp {
         // while a disc just sits in the tray.
         let running = self.emu.running();
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        if self.emu.disc_loaded() {
+        if self.emu.disc_loaded() && !self.fz1_tray_open { // spin only when tray closed
             self.disc_angle += dt * if running { 9.0 } else { 0.6 };
             ctx.request_repaint();
         }
@@ -2029,9 +2138,17 @@ impl eframe::App for GuiApp {
             self.art_overlay(&ctx);
         }
 
-        if !self.status.is_empty() {
+        let pads = self.pad_names();
+        if !self.status.is_empty() || !pads.is_empty() {
             egui::Panel::bottom("status").show(ui, |ui| {
-                ui.label(egui::RichText::new(&self.status).small().color(TEXT_DIM));
+                if !self.status.is_empty() {
+                    ui.label(egui::RichText::new(&self.status).small().color(TEXT_DIM));
+                }
+                for name in pads {
+                    ui.label(
+                        egui::RichText::new(format!("pad connected: {name}")).small().color(TEXT_DIM),
+                    );
+                }
             });
         }
 
@@ -2497,6 +2614,7 @@ impl GuiApp {
 }
 
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = match Config::from_args() {
         Ok(c) => c,
@@ -2505,7 +2623,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(if e.starts_with("usage") { 0 } else { 2 });
         }
     };
+    run(cfg, None)
+}
 
+/// Android's entry point: the activity arrives from `android-activity`, and
+/// winit takes the native window from there. The `#[no_mangle]` export lives in
+/// `android/src/lib.rs`, outside this file's `forbid(unsafe_code)`.
+#[cfg(target_os = "android")]
+pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
+    let cfg = Config::from_args().unwrap_or_else(|_| Config::with_defaults());
+    let _ = run(cfg, Some(app));
+}
+
+#[cfg(target_os = "android")]
+type AndroidContext = winit::platform::android::activity::AndroidApp;
+#[cfg(not(target_os = "android"))]
+type AndroidContext = ();
+
+/// Hand the activity to winit's android backend; nothing to do elsewhere.
+#[cfg(target_os = "android")]
+fn attach_activity(options: &mut eframe::NativeOptions, app: Option<AndroidContext>) {
+    options.android_app = app;
+}
+#[cfg(not(target_os = "android"))]
+fn attach_activity(_options: &mut eframe::NativeOptions, _app: Option<AndroidContext>) {}
+
+/// Paint the launcher: one window on a desk, the whole screen on a handheld.
+fn run(cfg: Config, app: Option<AndroidContext>) -> Result<(), Box<dyn std::error::Error>> {
     let icon = image::load_from_memory(include_bytes!("../../assets/retro3do-icon-1024.png"))
         .ok()
         .map(|img| {
@@ -2523,10 +2667,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
+    attach_activity(&mut options, app);
     eframe::run_native(
         "retro3do",
         options,

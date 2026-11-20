@@ -21,14 +21,22 @@ lzma-rs = "0.3"
 ruzstd = "0.8"
 # Only the headless check tool writes PNG files; the library never does.
 png = "0.17"
-# Only the desktop front ends use SDL3; the library and check tool never do.
-sdl3 = { version = "0.22", features = ["use-pkg-config"] }
 # Only the graphical front end uses these; the library never does.
 egui = "0.36"
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 gltf = "1.4.1"
 bytemuck = "1.25.2"
+
+# Only the desktop front ends use SDL3 (audio devices and gamepads); the library
+# and check tool never do, and Android has no SDL3 at all.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+sdl3 = { version = "0.22", features = ["use-pkg-config"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+
+# On Android egui paints through winit's native-activity backend, which is the
+# one that needs no Java glue beyond the manifest (see android/).
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "android-native-activity"] }
 
 [profile.dev]
 # Guest arithmetic is written with explicit wrapping operations; keeping
