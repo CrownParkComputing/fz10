@@ -3229,18 +3229,26 @@ impl GuiApp {
         // width the lettering needs.
         // A fifth taller than it was: the spines read from a sofa.
         let shelf_h = (area.height() * 0.528).clamp(360.0, 672.0).min(area.height() * 0.72);
-        let scene = egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, area.max.y - shelf_h));
         let strip = egui::Rect::from_min_max(egui::pos2(area.min.x, area.max.y - shelf_h), area.max);
-        match self.case_open {
-            Some(index) => self.view_case(ui, frame, scene, index),
-            None => self.view_attract(ui, frame, scene),
-        }
         // The shelf comes in as the machine settles out of its box, and
         // goes as it is packed away.
         let alpha = match self.closing {
             Some(c) => 1.0 - (c * 4.0).min(1.0),
             None => ((self.fz1_state.unbox - 0.8) / 0.2).clamp(0.0, 1.0),
         };
+        // While the carton is still turning and the machine is coming out of
+        // it, there is no shelf, so the show gets the whole window: the scene
+        // keeps the strip's room until the shelf arrives to claim it. Drawn
+        // only as tall as the strip is empty, the reveal is never cut off
+        // along a line the player cannot see the reason for.
+        let scene = egui::Rect::from_min_max(
+            area.min,
+            egui::pos2(area.max.x, area.max.y - shelf_h * smoothstep(alpha)),
+        );
+        match self.case_open {
+            Some(index) => self.view_case(ui, frame, scene, index),
+            None => self.view_attract(ui, frame, scene),
+        }
         if alpha > 0.0 {
             self.view_shelf(ui, strip, alpha);
         }
@@ -3530,7 +3538,7 @@ impl GuiApp {
     /// Play the RETRO3DO_SCRIPT automation: `secs:action` entries, where an
     /// action is `shot:NAME` (window screenshot into RETRO3DO_SHOT_DIR),
     /// `case:GAME`, `load:GAME` (GAME an index or part of a title), `esc`,
-    /// `click` (skip the show running) or `close`.
+    /// `eject`, `click` (skip the show running) or `close`.
     fn run_script(&mut self, ctx: &egui::Context) {
         let shots: Vec<std::sync::Arc<ColorImage>> = ctx.input(|i| {
             i.events
@@ -3602,6 +3610,7 @@ impl GuiApp {
                         self.intro_done();
                     }
                 }
+                "eject" => self.eject(),
                 "tray" => self.toggle_tray(),
                 "scroll" => self.settings_scroll = arg.parse().ok(),
                 "dirs" => self.apply_dirs(),
