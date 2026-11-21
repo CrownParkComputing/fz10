@@ -219,3 +219,17 @@ reach the window on this box. Verified in the real window
 (~/.cache/r3tmp/shots-ui5): `hidden.png` the game with a bare window,
 `woken.png` a second after the key the eject mark, the hamburger and the cog
 are back, `slept.png` five seconds on they are gone again.
+
+## 8. Finalisation + AI Deck registration — DONE, verified (2026-11-21)
+- `app/cargo build --release`: clean (no source newer than the release binaries).
+  `cargo test --bin retro3do-gui`: 26 passed, 0 failed.
+- Headless verification: `in_game_check panafz10.bin "Road Rash (USA).chd"`
+  → 59.97 fields/s, 0 deadline resets; the final frame is the in-game 3D
+  street/bike/HUD (`~/ai-scratch/3do-rr3do-gameplay.png`). `probe` frames at
+  1200/2400 confirm the race, not just one lucky frame.
+- `~/3do-work/rr3do.iso` (raw ISO) does NOT boot here: 2400 fields of `probe`
+  sit on the BIOS "Insert CD" screen. The CHD dump of the same disc boots.
+- AI Deck `ready.json`: `retro3do-rs`, state `TEST`, launch
+  `/home/jon/retro3do-rs/launch-road-rash.sh` (chmod +x), args `[]`, cwd repo.
+  Wrapper execs `retro3do-sdl --bios panafz10.bin --disc "Road Rash (USA).chd"`;
+  launch checked with a 10 s timeout — renderer `vulkan`, no errors.

@@ -6,6 +6,12 @@ other emulator was used. The reference's own provenance record
 (`cpp-reference/docs/PROVENANCE.md`) applies to the hardware knowledge carried
 over and must travel with this crate.
 
+
+Repository-level provenance, the per-module source register, the
+no-copied-source audit and the third-party/licence record are in
+`docs/PROVENANCE.md`, `docs/SOURCES.md`, `docs/AUDIT.md` and
+`docs/THIRD_PARTY.md`. This file is the per-file carry-over list only.
+
 ## Files carried over from the reference
 
 | File here | Source | What it is |

@@ -385,8 +385,6 @@ pub fn load_carton() -> Option<Model> {
 /// the sleeve alone, and a disc is only ever seen going into the drive.
 pub fn load_case() -> Option<Model> {
     let mut m = load_glb(include_bytes!("../../../assets/dvd-case/case.glb"), Kind::Case)?;
-    m.parts
-        .retain(|p| !matches!(p.name.as_str(), "CaseDisc" | "DiscHub" | "DiscRing"));
     m.refit();
     m.place = mat_mul(&mat_rot_z(std::f32::consts::FRAC_PI_2), &mat_rot_x(std::f32::consts::FRAC_PI_2));
     Some(m)
@@ -569,7 +567,7 @@ struct Target {
 }
 
 /// The pictures that change with the game.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtSlot {
     /// What the disc on the FZ-1's tray wears: the game's own disc art.
     Platter,
@@ -589,8 +587,10 @@ impl ArtSlot {
 
     fn of_material(name: &str) -> Option<Self> {
         match name {
-            "Disc" => Some(ArtSlot::Platter),
-            "Wrap" => Some(ArtSlot::Wrap),
+            // The disc in the open case is the same game's disc art as the
+            // one on the machine's platter, and the same square UV.
+            "Disc" | "CaseDisc" => Some(ArtSlot::Platter),
+            "Wrap" | "WrapLid" => Some(ArtSlot::Wrap),
             _ => None,
         }
     }
@@ -641,10 +641,16 @@ pub struct Fz1State {
     pub lit: bool,
     /// The ACCESS lamp's level, 0..1.
     pub access: f32,
+    /// 0 = case shut, 1 = lid fully open. The GUI eases it toward `lid_goal`.
+    pub lid: f32,
+    pub lid_goal: f32,
     /// How far the machine has come out of its carton: 0 sealed, 1 out on
     /// the table with the carton gone. Played backwards when the app closes.
     pub unbox: f32,
 }
+
+/// A keep case opens a little past flat and stops there.
+const LID_OPEN: f32 = 2.967; // 170 degrees
 
 const DISC_TEX_SIZE: u32 = 1024;
 /// Edges are antialiased 4x: the machine's long straight edges stair-step
@@ -1202,6 +1208,11 @@ impl Fz1Renderer {
                         world = mat_mul(&world, &mat_rot_y(anim.spin));
                     }
                 }
+                // The lid and the sleeve panel printed on it share the
+                // hinge, so they take the same rotation about the spine.
+                (Kind::Case, "CaseLid" | "WrapLid") => {
+                    world = mat_mul(&world, &mat_rot_x(-anim.lid * LID_OPEN))
+                }
                 (Kind::Carton, _) if !unboxing => return None,
                 (Kind::Carton, "BoxLid") => world = mat_mul(&world, &mat_rot_x(-pose.lid)),
                 (Kind::Carton, "FlapLeft") => world = mat_mul(&world, &mat_rot_z(pose.flaps)),
@@ -1405,4 +1416,36 @@ fn bytemuck_f32(v: &[f32]) -> &[u8] {
 
 fn bytemuck_u32(v: &[u32]) -> &[u8] {
     bytemuck::cast_slice(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The open case needs its disc and both sleeve panels: a case that only
+    /// carried the static wrap could never show the full open/close cycle.
+    #[test]
+    fn the_case_keeps_its_disc_and_both_sleeve_panels() {
+        let case = load_case().expect("case.glb");
+        let names: Vec<&str> = case.parts.iter().map(|p| p.name.as_str()).collect();
+        for part in [
+            "CaseShell",
+            "CaseLid",
+            "Wrap",
+            "WrapLid",
+            "CaseDisc",
+            "DiscRing",
+            "DiscHub",
+        ] {
+            assert!(names.contains(&part), "case.glb is missing {part}: {names:?}");
+        }
+    }
+
+    /// The panel that swings with the lid wears the wrap; the disc inside
+    /// wears the same square label as the machine's platter.
+    #[test]
+    fn the_lid_panel_and_case_disc_use_the_case_art_slots() {
+        assert_eq!(ArtSlot::of_material("WrapLid"), Some(ArtSlot::Wrap));
+        assert_eq!(ArtSlot::of_material("CaseDisc"), Some(ArtSlot::Platter));
+    }
 }

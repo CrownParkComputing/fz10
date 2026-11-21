@@ -76,8 +76,8 @@ fn main() -> Result<(), String> {
             "sides",
             case_art::CaseArt {
                 title: "Which Way Round".to_string(),
-                front: Some(PathBuf::from("assets/3do-mark.png")),
-                back: Some(PathBuf::from("assets/retro_recomp_logo.png")),
+                front: Some(PathBuf::from("assets/cpc-mark.png")),
+                back: Some(PathBuf::from("assets/fz1-poster.jpg")),
                 discs: 1,
                 ..Default::default()
             },
@@ -85,32 +85,39 @@ fn main() -> Result<(), String> {
         (
             "scanned",
             case_art::CaseArt {
-                title: "Gex".to_string(),
-                front: Some(textures.join("gow2.jpg")),
-                back: Some(textures.join("gow2.jpg")),
-                disc: Some(textures.join("gow2-dvd.jpg")),
+                title: "Sample Disc".to_string(),
+                front: Some(textures.join("cover-front-sample.jpg")),
+                back: Some(textures.join("cover-back-sample.jpg")),
+                disc: Some(textures.join("disc-sample.jpg")),
                 discs: 1,
                 ..Default::default()
             },
         ),
     ];
-    let views: &[(&str, f32, f32)] = &[
-        ("front", 0.0, 0.06),
-        ("three-quarter", 0.45, 0.22),
-        ("spine", std::f32::consts::FRAC_PI_2, 0.06),
-        ("spine-left", -std::f32::consts::FRAC_PI_2, 0.06),
-        ("back", std::f32::consts::PI, 0.06),
-        ("top", 0.0, 1.0),
+    // name, yaw, pitch, how far the lid stands open.
+    let views: &[(&str, f32, f32, f32)] = &[
+        ("front", 0.0, 0.06, 0.0),
+        ("three-quarter", 0.45, 0.22, 0.0),
+        ("spine", std::f32::consts::FRAC_PI_2, 0.06, 0.0),
+        ("spine-left", -std::f32::consts::FRAC_PI_2, 0.06, 0.0),
+        ("back", std::f32::consts::PI, 0.06, 0.0),
+        ("top", 0.0, 1.0, 0.0),
+        ("open", 0.30, 0.30, 1.0),
+        ("half-open", 0.30, 0.30, 0.5),
     ];
 
     for (game, art) in &games {
         let wrap = case_art::wrap(art);
         r.set_art(&state, fz1_3d::ArtSlot::Wrap, wrap.as_raw());
-        for &(name, yaw, pitch) in views {
+        // The disc in the case wears the same art as the machine's platter.
+        let disc = case_art::disc(art);
+        r.set_art(&state, fz1_3d::ArtSlot::Platter, disc.as_raw());
+        for &(name, yaw, pitch, lid) in views {
             let anim = fz1_3d::Fz1State {
                 case_yaw: yaw,
                 case_pitch: pitch,
-                case_zoom: 0.92,
+                case_zoom: if lid > 0.0 { 1.95 } else { 0.92 },
+                lid,
                 unbox: 1.0,
                 ..Default::default()
             };

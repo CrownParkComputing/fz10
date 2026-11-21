@@ -173,6 +173,8 @@ fn smoothstep(t: f32) -> f32 {
 /// The drawer's travel rate (full travel per second) and how long the
 /// platter spins up before the machine is switched on.
 const TRAY_RATE: f32 = 0.5;
+/// The case lid takes about a second and a half to swing.
+const LID_RATE: f32 = 0.7;
 const SPINUP_SECS: f32 = 2.6;
 
 /// Audio the stream keeps buffered — about 93 ms at 44.1 kHz, deep enough to
@@ -1300,6 +1302,9 @@ struct GuiApp {
     /// The case being looked at in the upper view, and the game whose
     /// artwork is in the case model's slots.
     case_open: Option<usize>,
+    /// Whether the case in the upper view stands open on its hinge. A case
+    /// arrives shut with its wrap artwork showing; the lid only opens here.
+    case_lid_open: bool,
     case_art_for: Option<usize>,
     /// Composed artwork coming back from worker threads: which slot, the
     /// key it was asked for under, and the RGBA pixels.
@@ -1576,6 +1581,7 @@ impl GuiApp {
             pad_hint: 0.0,
             settled_for: 0.0,
             case_open: None,
+            case_lid_open: false,
             case_art_for: None,
             slot_tx,
             slot_rx,
@@ -1888,6 +1894,24 @@ impl GuiApp {
             return;
         }
         let mut mask = keyboard_mask(ctx) | std::mem::take(&mut self.script_pad);
+        // Enter/Space swing the lid of the case in view. They are also the
+        // keyboard's PLAY, so while a case is open consume that bit for as
+        // long as either key is held - otherwise the next frame reads the
+        // same hold as a fresh press and launches the disc. The pad's own
+        // PLAY is untouched and still puts the disc in.
+        if self.case_open.is_some() {
+            let lid_key = |i: &egui::InputState| {
+                i.key_down(egui::Key::Enter) || i.key_down(egui::Key::Space)
+            };
+            if ctx.input(lid_key) {
+                mask &= !(1u32 << (PadButton::Play as u32));
+            }
+            if ctx.input(|i| {
+                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
+            }) {
+                self.case_lid_open = !self.case_lid_open;
+            }
+        }
         if let Some(io) = self.io.as_mut() {
             mask |= io.pad_mask(self.cfg.pad_primary);
         }
@@ -1957,6 +1981,7 @@ impl GuiApp {
         if fresh & bit(PadButton::B) != 0 {
             if case.is_some() {
                 self.case_open = None;
+                self.case_lid_open = false;
             } else if self.emu.running() {
                 self.frontend = false;
             }
@@ -2543,10 +2568,18 @@ impl GuiApp {
         let tx = self.slot_tx.clone();
         let key = format!("case:{index}");
         std::thread::spawn(move || {
-            // The preview shows the sleeve alone: no disc, so no disc art.
             let wrap = case_art::wrap(&art);
             let _ = tx.send((fz1_3d::ArtSlot::Wrap, key, wrap.as_raw().to_vec()));
         });
+        // The disc inside the case wears the same label as the machine's
+        // platter. Dress that slot too, unless a game is actually running and
+        // the platter belongs to it.
+        if self.game.is_none() {
+            if let Some(art) = self.platter_art(index) {
+                self.fz1_disc_art = Some(art.clone());
+                self.request_platter(art);
+            }
+        }
     }
 
     /// Hand finished artwork to the renderer, if it is still what is wanted.
@@ -2633,6 +2666,9 @@ impl GuiApp {
             self.fz1_state.case_yaw = 0.35;
             self.fz1_state.case_pitch = 0.12;
             self.fz1_state.case_zoom = 1.0;
+            // It comes off the shelf as a sealed case: the wrap is what you
+            // see until the lid is opened from here.
+            self.case_lid_open = false;
         }
         self.case_open = Some(index);
     }
@@ -2647,6 +2683,7 @@ impl GuiApp {
         }
         self.selected = Some(index);
         self.case_open = None;
+        self.case_lid_open = false;
         self.frontend = false;
         // Whatever is running stops now; its disc comes out with the drawer.
         if self.emu.running() {
@@ -2835,6 +2872,13 @@ impl GuiApp {
         let step = dt * TRAY_RATE;
         let gap = self.fz1_state.tray_goal - self.fz1_state.tray;
         self.fz1_state.tray += gap.clamp(-step, step);
+        // Every case lies shut until its lid is opened in the case view. Only
+        // `case_lid_open` drives the hinge, so the wrap shows while closed and
+        // the disc on its hub shows once open.
+        self.fz1_state.lid_goal = if self.case_lid_open { 1.0 } else { 0.0 };
+        let lid_step = dt * LID_RATE;
+        let lid_gap = self.fz1_state.lid_goal - self.fz1_state.lid;
+        self.fz1_state.lid += lid_gap.clamp(-lid_step, lid_step);
         let platter = self.platter_game();
         self.fz1_state.disc_shown = platter.is_some();
         if self.load.is_none() {
@@ -3139,25 +3183,35 @@ impl GuiApp {
         ui.painter().text(
             egui::pos2(rect.center().x, rect.min.y + 40.0),
             egui::Align2::CENTER_CENTER,
-            "drag to turn it over · wheel to zoom",
+            "drag to turn it over · wheel to zoom · enter to open/close",
             egui::FontId::proportional(11.0),
             TEXT_DIM,
         );
         let bar = egui::Rect::from_center_size(
             egui::pos2(rect.center().x, rect.max.y - 26.0),
-            egui::vec2(300.0, 34.0),
+            egui::vec2(390.0, 34.0),
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             ui.horizontal_centered(|ui| {
+                let toggle = if self.case_lid_open {
+                    "▣  Close case"
+                } else {
+                    "▣  Open case"
+                };
+                if ui.button(egui::RichText::new(toggle).size(15.0)).clicked() {
+                    self.case_lid_open = !self.case_lid_open;
+                }
                 // Putting the disc in is the floating insert mark in the
                 // corner now, paired with the eject one.
                 if ui.button(egui::RichText::new("✕  Back").size(15.0)).clicked() {
                     self.case_open = None;
+                    self.case_lid_open = false;
                 }
             });
         });
         if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
             self.case_open = None;
+            self.case_lid_open = false;
         }
         ui.ctx().request_repaint();
     }
@@ -4016,8 +4070,9 @@ impl GuiApp {
 
     /// Play the RETRO3DO_SCRIPT automation: `secs:action` entries, where an
     /// action is `shot:NAME` (window screenshot into RETRO3DO_SHOT_DIR),
-    /// `case:GAME`, `load:GAME` (GAME an index or part of a title), `esc`,
-    /// `eject`, `click` (skip the show running) or `close`. `key` pushes a
+    /// `case:GAME`, `load:GAME` (GAME an index or part of a title), `lid`
+    /// (swing the case's lid), `esc`, `eject`, `click` (skip the show
+    /// running) or `close`. `key` pushes a
     /// key press into egui, waking the chrome the way a real touch does.
     fn run_script(&mut self, ctx: &egui::Context) {
         let shots: Vec<std::sync::Arc<ColorImage>> = ctx.input(|i| {
@@ -4066,6 +4121,7 @@ impl GuiApp {
                         self.open_case(g);
                     }
                 }
+                "lid" => self.case_lid_open = !self.case_lid_open,
                 "load" => {
                     if let Some(g) = game {
                         self.start_load(g);

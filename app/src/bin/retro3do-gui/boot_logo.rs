@@ -74,7 +74,7 @@ pub fn render() -> ColorImage {
 
 /// The 3DO badge alone — the mark the machine view's wallpaper is tiled with.
 pub fn badge() -> ColorImage {
-    embedded(include_bytes!("../../../assets/3do-mark.png"))
+    embedded(include_bytes!("../../../assets/cpc-mark.png"))
 }
 
 /// Boot the BIOS in a headless console and keep the brightest frame in the

@@ -223,7 +223,7 @@ fn blit(dst: &mut RgbaImage, src: &RgbaImage, x: i64, y: i64) {
 fn mark() -> Option<&'static RgbaImage> {
     static MARK: OnceLock<Option<RgbaImage>> = OnceLock::new();
     MARK.get_or_init(|| {
-        image::load_from_memory(include_bytes!("../../../assets/3do-mark.png"))
+        image::load_from_memory(include_bytes!("../../../assets/cpc-mark.png"))
             .ok()
             .map(|img| img.to_rgba8())
     })
