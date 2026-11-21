@@ -61,6 +61,34 @@ const SPIN_FRAC: f32 = SPIN_SECS / INTRO_SECS;
 /// The yaw the machine view sits at: a three-quarter view, and where the
 /// presentation spin starts and lands.
 const YAW0: f32 = 0.42;
+/// The canvas a generated spine is drawn on: a real spine's proportions,
+/// at a size that still reads when the shelf lifts one out.
+const GEN_SPINE_W: u32 = 128;
+const GEN_SPINE_H: u32 = 1890;
+
+/// What the pad does in the launcher, shown on the shelf and on the
+/// settings page so none of it has to be guessed at.
+const PAD_MAP: &str =
+    "pad · left/right pick · up case · A select, then boot · B back · \
+     C hide or show · P play · L/R zoom · X close";
+
+/// The same map, cut to what a narrow window has room for.
+const PAD_MAP_SHORT: &str = "pad · d-pad picks · A boot · B back · C hide · X close";
+
+/// The same map, a row each, for the settings page.
+const PAD_LAUNCHER: &[(&str, &str)] = &[
+    ("left / right", "along the shelf - or turn the case when one is open"),
+    ("up / down", "open the case the shelf points at - or tilt it, and the machine"),
+    ("A", "take the case out, then put its disc in"),
+    ("B", "back: shut the case, or back to the game"),
+    ("C", "hide the title, or put a hidden one back"),
+    ("P", "play: the disc goes straight in"),
+    ("L / R", "zoom out and in on whatever is on the table"),
+    ("X", "put the machine away and close the launcher"),
+];
+
+/// How far the tiled wall drifts before it turns round and goes back.
+const WALL_SPAN: f32 = 1400.0;
 /// How long the overlay icons stay up after the player's last touch while a
 /// game is on screen.
 const CHROME_IDLE: Duration = Duration::from_secs(3);
@@ -208,6 +236,9 @@ struct Config {
     texdir: Option<PathBuf>,
     /// Explicit artwork map: ROM stem and media set to artwork file.
     name_map: HashMap<(String, String), String>,
+    /// Titles the person has hidden, by disc file stem. They are kept out of
+    /// the shelf until "show hidden" is on.
+    hidden: std::collections::HashSet<String>,
     /// Print where every game finds its artwork and stop.
     resolve: bool,
     /// The game picture filtered smoothly on the way up to the window,
@@ -344,6 +375,9 @@ impl Config {
                 "smooth" => self.smooth = value == "true",
                 "cpu_scale" => self.cpu_scale = value.parse().unwrap_or(100).clamp(100, 150),
                 "pad_primary" => self.pad_primary = value.parse().unwrap_or(0),
+                "hidden" => {
+                    self.hidden = value.split('|').map(str::to_string).collect();
+                }
                 "pad_bind" => {
                     let bind = bindings_from_text(&value);
                     if !bind.is_empty() {
@@ -363,7 +397,8 @@ impl Config {
         }
         let text = format!(
             "games = {}\nbios = {}\nsaves = {}\nmedia = {}\nbios_file = {}\n\
-             smooth = {}\ncpu_scale = {}\npad_primary = {}\npad_bind = {}\n",
+             smooth = {}\ncpu_scale = {}\npad_primary = {}\npad_bind = {}\n\
+             hidden = {}\n",
             self.games_dir.display(),
             self.bios_dir.display(),
             self.saves_dir.display(),
@@ -373,6 +408,11 @@ impl Config {
             self.cpu_scale,
             self.pad_primary,
             bindings_to_text(&self.pad_bind),
+            {
+                let mut names: Vec<&str> = self.hidden.iter().map(String::as_str).collect();
+                names.sort_unstable();
+                names.join("|")
+            },
         );
         std::fs::write(&path, text).map_err(|e| e.to_string())
     }
@@ -391,6 +431,7 @@ impl Config {
             configured: false,
             texdir: std::env::var_os("RETRO3DO_TEXDIR").map(PathBuf::from),
             name_map: HashMap::new(),
+            hidden: std::collections::HashSet::new(),
             resolve: false,
             smooth: false,
             cpu_scale: 100,
@@ -1099,6 +1140,24 @@ pub fn android_pad_axis(axis: i32, value: f32) {
     android_pad::set_axis(axis, value);
 }
 
+/// The 3DO buttons by the name the script harness and the settings page
+/// use for them.
+fn sdl_pad_names() -> [(&'static str, PadButton); 11] {
+    [
+        ("up", PadButton::Up),
+        ("down", PadButton::Down),
+        ("left", PadButton::Left),
+        ("right", PadButton::Right),
+        ("a", PadButton::A),
+        ("b", PadButton::B),
+        ("c", PadButton::C),
+        ("play", PadButton::Play),
+        ("stop", PadButton::Stop),
+        ("l", PadButton::LeftShift),
+        ("r", PadButton::RightShift),
+    ]
+}
+
 fn keyboard_mask(ctx: &egui::Context) -> u32 {
     let mut mask = 0u32;
     ctx.input(|i| {
@@ -1223,6 +1282,17 @@ struct GuiApp {
     backs: Vec<Option<PathBuf>>,
     /// How far the shelf has scrolled when it is wider than the window.
     shelf_scroll: f32,
+    /// Whether hidden titles are on show (the shelf's own toggle), and
+    /// whether the shelf should scroll to bring the selection into view —
+    /// set when the pad moves it, since the pad cannot see where it went.
+    show_hidden: bool,
+    shelf_follow: bool,
+    /// The pad buttons held last frame, how long the held direction has
+    /// waited before repeating, and how long the on-screen pad map has left
+    /// to show.
+    pad_prev: u32,
+    pad_hold: f32,
+    pad_hint: f32,
     /// Seconds the machine has stood settled on the table. The shelf is held
     /// back until the unboxing has played out, so nothing is drawn over the
     /// reveal; see `SHELF_WAIT` and `SHELF_FADE`.
@@ -1256,6 +1326,9 @@ struct GuiApp {
     /// be written.
     script: Vec<(f32, String)>,
     shots: std::collections::VecDeque<String>,
+    /// A pad button the script is holding down this frame (`pad:right`),
+    /// taken by `pad_ui` the way a real pad's mask is.
+    script_pad: u32,
     /// Opacity of the "drag to rotate" hint: 1 while it is new, draining to
     /// 0 once it has had its moment or been acted on. `orbit_seen` counts the
     /// seconds the machine has been on screen as a control, so the hint's
@@ -1282,8 +1355,12 @@ struct GuiApp {
     picker_step: usize,
     /// When the window opened.
     launched: Instant,
-    /// How far the badge wallpaper has drifted, in points.
+    /// How far the badge wallpaper has drifted, in points, and which way
+    /// each axis is going: the drift turns round at `WALL_SPAN` rather than
+    /// snapping back to nothing.
     wall_drift: f32,
+    wall_drift_x: f32,
+    wall_dir: egui::Vec2,
     /// Whether the model's drawer is out. The machine's own open/close button
     /// toggles it; powering on shuts it.
     fz1_tray_open: bool,
@@ -1492,6 +1569,11 @@ impl GuiApp {
             spines: Vec::new(),
             backs: Vec::new(),
             shelf_scroll: 0.0,
+            show_hidden: false,
+            shelf_follow: false,
+            pad_prev: 0,
+            pad_hold: 0.0,
+            pad_hint: 0.0,
             settled_for: 0.0,
             case_open: None,
             case_art_for: None,
@@ -1509,6 +1591,7 @@ impl GuiApp {
                 .map(|s| parse_script(&s))
                 .unwrap_or_default(),
             shots: std::collections::VecDeque::new(),
+            script_pad: 0,
             orbit_hint: 1.0,
             orbit_seen: 0.0,
             picture_live: false,
@@ -1522,6 +1605,8 @@ impl GuiApp {
             picker_step: 0,
             launched: Instant::now(),
             wall_drift: 0.0,
+            wall_drift_x: 0.0,
+            wall_dir: egui::vec2(1.0, 1.0),
             fz1_tray_open: true,
             fz1_user_zoom: 1.0,
             game: None,
@@ -1787,6 +1872,148 @@ impl GuiApp {
     /// The gamepads SDL reports, for the settings page.
     fn pad_names(&self) -> Vec<String> {
         self.io.as_ref().map_or_else(Vec::new, |io| io.names())
+    }
+
+    /// The pad drives the launcher itself, not only the game: the same
+    /// button mask the console is fed is read here first while the launcher
+    /// is on screen, so a phone with a controller never needs the touch
+    /// screen. See `PAD_MAP` for what each button does.
+    fn pad_ui(&mut self, ctx: &egui::Context) {
+        // Only while the launcher is what is on screen: a running game has
+        // the pad to itself.
+        let busy = self.load.is_some() || self.closing.is_some() || self.intro < 1.0;
+        let launcher = self.view == View::Machine && (self.frontend || !self.emu.running());
+        if busy || !launcher {
+            self.pad_prev = 0;
+            return;
+        }
+        let mut mask = keyboard_mask(ctx) | std::mem::take(&mut self.script_pad);
+        if let Some(io) = self.io.as_mut() {
+            mask |= io.pad_mask(self.cfg.pad_primary);
+        }
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        let bit = |b: PadButton| 1u32 << (b as u32);
+        let fresh = mask & !self.pad_prev;
+        self.pad_prev = mask;
+        if mask != 0 {
+            // Anything pressed brings the map back up for a moment.
+            self.pad_hint = 4.0;
+        }
+        // A held direction repeats, after a pause, so a long shelf can be
+        // walked without pumping the stick.
+        let dirs = bit(PadButton::Left) | bit(PadButton::Right) | bit(PadButton::Up) | bit(PadButton::Down);
+        let mut step = fresh & dirs;
+        if mask & dirs == 0 {
+            self.pad_hold = 0.0;
+        } else {
+            if step != 0 {
+                self.pad_hold = -0.35;
+            }
+            self.pad_hold += dt;
+            if self.pad_hold >= 0.09 {
+                self.pad_hold = 0.0;
+                step |= mask & dirs;
+            }
+        }
+        let case = self.case_open;
+        // Left and right: along the shelf, or round the case when one is
+        // open and its own turn is what the stick is for.
+        if case.is_some() {
+            let spin = f32::from(step & bit(PadButton::Right) != 0)
+                - f32::from(step & bit(PadButton::Left) != 0);
+            let tilt = f32::from(step & bit(PadButton::Down) != 0)
+                - f32::from(step & bit(PadButton::Up) != 0);
+            self.fz1_state.case_yaw += spin * 0.12;
+            self.fz1_state.case_pitch = (self.fz1_state.case_pitch + tilt * 0.08).clamp(-1.2, 1.2);
+        } else {
+            let move_by = i32::from(step & bit(PadButton::Right) != 0)
+                - i32::from(step & bit(PadButton::Left) != 0);
+            if move_by != 0 {
+                self.move_selection(move_by);
+            }
+            // Up opens the case of whatever the shelf points at; down turns
+            // the machine on its stand instead.
+            if step & bit(PadButton::Up) != 0 {
+                if let Some(i) = self.selected.or_else(|| self.visible_games().first().copied()) {
+                    self.open_case(i);
+                }
+            }
+            if step & bit(PadButton::Down) != 0 {
+                self.fz1_state.pitch = (self.fz1_state.pitch + 0.08).clamp(-1.2, 1.2);
+            }
+        }
+        // A: the case, then the disc. B: back out of it.
+        if fresh & bit(PadButton::A) != 0 {
+            match (case, self.selected) {
+                (Some(i), _) => self.start_load(i),
+                (None, Some(i)) => self.open_case(i),
+                (None, None) => {
+                    if let Some(i) = self.visible_games().first().copied() {
+                        self.open_case(i);
+                    }
+                }
+            }
+        }
+        if fresh & bit(PadButton::B) != 0 {
+            if case.is_some() {
+                self.case_open = None;
+            } else if self.emu.running() {
+                self.frontend = false;
+            }
+        }
+        // P: put the disc in from wherever the shelf stands.
+        if fresh & bit(PadButton::Play) != 0 {
+            if let Some(i) = case.or(self.selected) {
+                self.start_load(i);
+            }
+        }
+        // C: hide the title, or put it back. L and R: in and out.
+        if fresh & bit(PadButton::C) != 0 {
+            if let Some(i) = case.or(self.selected) {
+                self.toggle_hidden(i);
+                if !self.show_hidden && self.is_hidden(i) {
+                    self.move_selection(1);
+                }
+            }
+        }
+        let zoom = f32::from(mask & bit(PadButton::RightShift) != 0)
+            - f32::from(mask & bit(PadButton::LeftShift) != 0);
+        if zoom != 0.0 {
+            if case.is_some() {
+                self.fz1_state.case_zoom = (self.fz1_state.case_zoom + zoom * dt * 1.4).clamp(0.5, 3.0);
+            } else {
+                self.fz1_user_zoom = (self.fz1_user_zoom + zoom * dt * 1.4).clamp(0.5, 3.0);
+            }
+        }
+        // X: put the machine away and close the launcher.
+        if fresh & bit(PadButton::Stop) != 0 {
+            self.begin_close();
+        }
+        if mask != 0 {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Walk the shelf's selection along by `by` places, wrapping at the
+    /// ends, and ask the shelf to scroll until it is in view.
+    fn move_selection(&mut self, by: i32) {
+        let shown = self.visible_games();
+        if shown.is_empty() {
+            return;
+        }
+        let at = self
+            .selected
+            .and_then(|sel| shown.iter().position(|&i| i == sel))
+            .map_or(0, |p| {
+                (p as i32 + by).rem_euclid(shown.len() as i32) as usize
+            });
+        if let Some(&index) = shown.get(at) {
+            self.selected = Some(index);
+            self.shelf_follow = true;
+            if self.case_open.is_some() {
+                self.open_case(index);
+            }
+        }
     }
 
     fn push_pads(&mut self, ctx: &egui::Context) {
@@ -2344,6 +2571,58 @@ impl GuiApp {
         }
     }
 
+    /// Whether a title is hidden: the shelf leaves it out until the hidden
+    /// ones are put back on show.
+    fn is_hidden(&self, index: usize) -> bool {
+        self.games
+            .get(index)
+            .is_some_and(|g| self.cfg.hidden.contains(&file_stem(&g.path)))
+    }
+
+    /// The titles the shelf shows, in shelf order.
+    fn visible_games(&self) -> Vec<usize> {
+        (0..self.games.len())
+            .filter(|&i| self.show_hidden || !self.is_hidden(i))
+            .collect()
+    }
+
+    /// Hide a title, or put it back. The flag lives with the rest of the
+    /// launcher's settings, so it survives the next run.
+    fn toggle_hidden(&mut self, index: usize) {
+        let Some(stem) = self.games.get(index).map(|g| file_stem(&g.path)) else {
+            return;
+        };
+        if !self.cfg.hidden.remove(&stem) {
+            self.cfg.hidden.insert(stem);
+            // A title that has just gone cannot stay the one on show.
+            if !self.show_hidden && self.case_open == Some(index) {
+                self.case_open = None;
+            }
+        }
+        if let Err(e) = self.cfg.save_settings() {
+            self.status = format!("settings not saved: {e}");
+        }
+    }
+
+    /// The drawn spine for a title the media folder has no spine scan of:
+    /// the generic 3DO card, composed once on a worker and kept as a
+    /// texture like any other piece of artwork.
+    fn drawn_spine_texture(&mut self, index: usize) -> Option<egui::TextureId> {
+        let title = self.games.get(index)?.title.clone();
+        let key = format!("spine:{title}");
+        if let Some(tex) = self.covers.get(&key) {
+            return Some(tex.id());
+        }
+        if self.art_asked.insert(key.clone()) {
+            let tx = self.result_tx.clone();
+            std::thread::spawn(move || {
+                let img = case_art::generic_spine(GEN_SPINE_W, GEN_SPINE_H, &title);
+                let _ = tx.send((key, img));
+            });
+        }
+        None
+    }
+
     /// Open a game's case in the upper view.
     fn open_case(&mut self, index: usize) {
         if self.games.get(index).is_none() {
@@ -2896,14 +3175,20 @@ impl GuiApp {
             [board.left_top(), board.right_top()],
             egui::Stroke::new(1.0, egui::Color32::from_white_alpha((40.0 * alpha) as u8)),
         );
-        if self.games.is_empty() {
+        let on_shelf = self.visible_games();
+        if on_shelf.is_empty() {
             painter.text(
                 strip.center(),
                 egui::Align2::CENTER_CENTER,
-                "no discs in the library folder",
+                if self.games.is_empty() {
+                    "no discs in the library folder"
+                } else {
+                    "every title is hidden - press C on the pad, or the eye below, to bring them back"
+                },
                 egui::FontId::proportional(13.0),
                 TEXT_DIM.gamma_multiply(alpha),
             );
+            self.shelf_chrome(ui, strip, alpha);
             return;
         }
         // Room above the spines for a pulled-out one and the title it names.
@@ -2914,7 +3199,7 @@ impl GuiApp {
         // wide — and never thinner than lettering can live in.
         let w = (h * SPINE_ASPECT * 1.5).max(22.0);
         let gap = 2.0;
-        let total = self.games.len() as f32 * (w + gap);
+        let total = on_shelf.len() as f32 * (w + gap);
         let room = strip.width() - 40.0;
         let hover_any = ui.rect_contains_pointer(strip);
         if total > room {
@@ -2926,6 +3211,22 @@ impl GuiApp {
         } else {
             self.shelf_scroll = 0.0;
         }
+        // The pad cannot reach for the shelf, so the shelf comes to it: a
+        // selection moved by the pad is scrolled into view.
+        if self.shelf_follow && total > room {
+            if let Some(at) = self
+                .selected
+                .and_then(|sel| on_shelf.iter().position(|&i| i == sel))
+            {
+                let left = at as f32 * (w + gap);
+                let want = self
+                    .shelf_scroll
+                    .min(left - 20.0)
+                    .max(left + w + 20.0 - room);
+                self.shelf_scroll = want.clamp(0.0, total - room);
+            }
+        }
+        self.shelf_follow = false;
         let mut x = if total > room {
             strip.min.x + 20.0 - self.shelf_scroll
         } else {
@@ -2936,7 +3237,7 @@ impl GuiApp {
         let mut load: Option<usize> = None;
         // A compact shelf: at most twenty spines on show at once.
         let mut shown = 0;
-        for index in 0..self.games.len() {
+        for &index in &on_shelf {
             let slot = egui::Rect::from_min_size(egui::pos2(x, board.min.y - h), egui::vec2(w, h));
             x += w + gap;
             if slot.max.x < strip.min.x || slot.min.x > strip.max.x {
@@ -2948,16 +3249,23 @@ impl GuiApp {
             }
             let press = ui.interact(slot, ui.id().with(("spine", index)), egui::Sense::click());
             let chosen = self.case_open == Some(index);
-            let lift = if press.hovered() || chosen { 10.0 } else { 0.0 };
+            let picked = self.selected == Some(index);
+            let lift = if press.hovered() || chosen || picked { 10.0 } else { 0.0 };
             let rect = slot.translate(egui::vec2(0.0, -lift));
+            // The game's own spine scan where the folder has one, the drawn
+            // 3DO spine where it has not.
             let tex = self
                 .spines
                 .get(index)
                 .cloned()
                 .flatten()
-                .and_then(|p| self.art_texture(&p));
+                .and_then(|p| self.art_texture(&p))
+                .or_else(|| self.drawn_spine_texture(index));
+            let faded = self.is_hidden(index);
             let painter = ui.painter_at(strip);
-            let tint = egui::Color32::WHITE.gamma_multiply(alpha);
+            // A hidden title on show while the hidden ones are up is drawn
+            // back, so it reads as one that has been put away.
+            let tint = egui::Color32::WHITE.gamma_multiply(if faded { alpha * 0.4 } else { alpha });
             match tex {
                 Some(id) => {
                     painter.image(
@@ -2980,11 +3288,15 @@ impl GuiApp {
                 egui::Stroke::new(1.0, egui::Color32::from_black_alpha((150.0 * alpha) as u8)),
                 StrokeKind::Inside,
             );
-            if chosen || self.game == Some(index) {
+            if chosen || picked || self.game == Some(index) {
                 painter.rect_filled(
                     egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(0.0, 3.0), egui::vec2(w, 3.0)),
                     1.0,
-                    if chosen { ACCENTS[3] } else { ACCENTS[1] },
+                    match (chosen || picked, chosen) {
+                        (true, true) => ACCENTS[3],
+                        (true, false) => ACCENTS[0],
+                        _ => ACCENTS[1],
+                    },
                 );
             }
             if press.hovered() {
@@ -3000,8 +3312,10 @@ impl GuiApp {
                 load = Some(index);
             } else if press.clicked() {
                 open = Some(index);
+                self.selected = Some(index);
             }
         }
+        self.shelf_chrome(ui, strip, alpha);
         if let Some((at, title)) = named {
             let at = egui::pos2(at.x.clamp(strip.min.x + 120.0, strip.max.x - 120.0), at.y);
             painter.text(
@@ -3020,6 +3334,75 @@ impl GuiApp {
             } else if let Some(i) = open {
                 self.open_case(i);
             }
+        }
+    }
+
+    /// The shelf's own furniture: the eye that puts hidden titles back on
+    /// show, the count of what is put away, and the pad map while it is
+    /// still worth showing.
+    fn shelf_chrome(&mut self, ui: &mut egui::Ui, strip: egui::Rect, alpha: f32) {
+        let hidden = (0..self.games.len()).filter(|&i| self.is_hidden(i)).count();
+        if hidden > 0 || self.show_hidden {
+            // A word, not a glyph: the launcher's font is the one the phone
+            // ships, and a word is read on any of them.
+            let label = if self.show_hidden {
+                format!("{hidden} hidden - put away")
+            } else {
+                format!("{hidden} hidden - show")
+            };
+            let spot = egui::Rect::from_min_size(
+                egui::pos2(strip.min.x + 16.0, strip.min.y + 8.0),
+                egui::vec2(170.0, 26.0),
+            );
+            let press = ui.interact(spot, ui.id().with("show-hidden"), egui::Sense::click());
+            let painter = ui.painter_at(strip);
+            painter.rect_filled(
+                spot,
+                6.0,
+                egui::Color32::from_black_alpha(if press.hovered() { 220 } else { 150 }),
+            );
+            painter.text(
+                spot.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                if self.show_hidden { ACCENTS[3] } else { TEXT_DIM },
+            );
+            if press.clicked() {
+                self.show_hidden = !self.show_hidden;
+            }
+            if press.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        // The pad map: up while the launcher is new, and again for a moment
+        // whenever the pad is touched, so it is learnt rather than looked up.
+        let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
+        self.pad_hint = (self.pad_hint - dt).max(0.0);
+        let fade = if self.launched.elapsed().as_secs_f32() < 12.0 {
+            1.0
+        } else {
+            (self.pad_hint / 1.5).min(1.0)
+        };
+        // The map gives way to its short form where the strip is too narrow
+        // to carry it beside the hidden count.
+        let room = strip.width() - if hidden > 0 || self.show_hidden { 210.0 } else { 40.0 };
+        let map = if room > PAD_MAP.chars().count() as f32 * 5.6 {
+            PAD_MAP
+        } else {
+            PAD_MAP_SHORT
+        };
+        if fade > 0.01 {
+            ui.painter_at(strip).text(
+                egui::pos2(strip.max.x - 16.0, strip.min.y + 21.0),
+                egui::Align2::RIGHT_CENTER,
+                map,
+                egui::FontId::proportional(11.0),
+                TEXT_DIM.gamma_multiply(fade * alpha),
+            );
+        }
+        if self.pad_hint > 0.0 {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -3071,6 +3454,7 @@ impl eframe::App for GuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.upload_pending(&ctx);
+        self.pad_ui(&ctx);
         self.push_pads(&ctx);
         self.poll_frame();
 
@@ -3345,33 +3729,47 @@ impl GuiApp {
             return;
         };
         let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
-        self.wall_drift += dt * 8.0;
+        // A slow diagonal, and it turns round at the bounds rather than
+        // snapping back: the wall never jumps, whichever way it is going.
+        self.wall_drift += dt * 8.0 * self.wall_dir.y;
+        self.wall_drift_x += dt * 3.4 * self.wall_dir.x;
+        if self.wall_drift.abs() > WALL_SPAN {
+            self.wall_dir.y = -self.wall_dir.y;
+            self.wall_drift = self.wall_drift.clamp(-WALL_SPAN, WALL_SPAN);
+        }
+        if self.wall_drift_x.abs() > WALL_SPAN {
+            self.wall_dir.x = -self.wall_dir.x;
+            self.wall_drift_x = self.wall_drift_x.clamp(-WALL_SPAN, WALL_SPAN);
+        }
         let pitch_y = 190.0;
         let badge_h = pitch_y;
         let badge_w = pitch_y * tex.size_vec2().x / tex.size_vec2().y.max(1.0);
         let pitch_x = badge_w * 2.1;
-        let uv =
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let tint = egui::Color32::from_white_alpha(18);
         let painter = ui.painter();
-        let mut row = 0usize;
-        let mut y = area.min.y - pitch_y + self.wall_drift % pitch_y;
-        while y < area.max.y {
-            let mut x = area.min.x - pitch_x + pitch_x * 0.5 * (row % 2) as f32;
-            while x < area.max.x {
+        // Tiles are placed by their own index in the wall, not by a counter
+        // that restarts at the top of the view: the brick stagger then
+        // belongs to the row itself, so a row crossing the edge keeps its
+        // offset instead of popping over by half a tile. A tile's margin
+        // either side draws over the seam.
+        let (ox, oy) = (self.wall_drift_x, self.wall_drift);
+        let row0 = ((area.min.y - oy) / pitch_y).floor() as i64 - 1;
+        let row1 = ((area.max.y - oy) / pitch_y).ceil() as i64 + 1;
+        for row in row0..=row1 {
+            let y = oy + row as f32 * pitch_y;
+            let stagger = pitch_x * 0.5 * row.rem_euclid(2) as f32;
+            let col0 = ((area.min.x - ox - stagger) / pitch_x).floor() as i64 - 1;
+            let col1 = ((area.max.x - ox - stagger) / pitch_x).ceil() as i64 + 1;
+            for col in col0..=col1 {
+                let x = ox + stagger + col as f32 * pitch_x;
                 painter.image(
                     tex.id(),
-                    egui::Rect::from_min_size(
-                        egui::pos2(x, y),
-                        egui::vec2(badge_w, badge_h),
-                    ),
+                    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h)),
                     uv,
                     tint,
                 );
-                x += pitch_x;
             }
-            y += pitch_y;
-            row += 1;
         }
         ui.ctx().request_repaint();
     }
@@ -3679,6 +4077,17 @@ impl GuiApp {
                     } else if self.emu.running() && self.frontend {
                         self.frontend = false;
                         self.emu.set_paused(false);
+                    }
+                }
+                "pad" => {
+                    // One pad button, held for a frame: the launcher's own
+                    // pad path is what the harness is exercising, so it is
+                    // fed the same mask a real pad would make.
+                    if let Some((_, button)) = sdl_pad_names()
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(arg))
+                    {
+                        self.script_pad |= 1 << (*button as u32);
                     }
                 }
                 "key" => {
@@ -4014,6 +4423,25 @@ impl GuiApp {
             "Controller",
             "Which pad drives the machine, and what each 3DO button answers to.",
         );
+        settings_card(ui, "The pad in the launcher", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "The launcher itself is driven from the pad, so a phone with a \
+                     controller never needs the screen.",
+                )
+                .color(TEXT_DIM),
+            );
+            ui.add_space(6.0);
+            for (button, does) in PAD_LAUNCHER {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [92.0, 18.0],
+                        egui::Label::new(egui::RichText::new(*button).strong()),
+                    );
+                    ui.label(egui::RichText::new(*does).color(TEXT_DIM));
+                });
+            }
+        });
         let pads = self.pad_names();
         settings_card(ui, "The pad", |ui| {
             if pads.is_empty() {
@@ -4510,6 +4938,7 @@ mod tests {
             configured: true,
             texdir: None,
             name_map: HashMap::new(),
+            hidden: std::collections::HashSet::new(),
             resolve: false,
             smooth: false,
             cpu_scale: 100,
@@ -4593,6 +5022,7 @@ mod tests {
             configured: true,
             texdir: None,
             name_map: HashMap::new(),
+            hidden: std::collections::HashSet::new(),
             resolve: false,
             smooth: false,
             cpu_scale: 100,

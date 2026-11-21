@@ -12,6 +12,7 @@
 //! egui or the GPU: the canvases go back as plain images.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use egui::ColorImage;
 use image::{imageops, Rgba, RgbaImage};
@@ -139,9 +140,8 @@ fn text(img: &mut RgbaImage, x: i64, y: i64, s: &str, scale: i64, c: Rgba<u8>, d
     }
 }
 
-/// `text` centred in a box, broken into lines that fit, each as wide as it
-/// can be. Returns the height it used.
-fn titled(img: &mut RgbaImage, x: i64, y: i64, w: i64, s: &str, scale: i64, c: Rgba<u8>) -> i64 {
+/// `s` broken into the lines that fit a box `w` wide at `scale`.
+fn wrap_lines(s: &str, w: i64, scale: i64) -> Vec<String> {
     let per_line = (w / ((GLYPH_W + 1) * scale)).max(1) as usize;
     let mut lines: Vec<String> = Vec::new();
     for word in s.split_whitespace() {
@@ -153,6 +153,25 @@ fn titled(img: &mut RgbaImage, x: i64, y: i64, w: i64, s: &str, scale: i64, c: R
             _ => lines.push(word.chars().take(per_line).collect()),
         }
     }
+    lines
+}
+
+/// The largest scale `s` can be set at and still fit a `w` x `h` box: a
+/// long title is printed smaller rather than run off its panel.
+fn fit_scale(s: &str, w: i64, h: i64, max: i64) -> i64 {
+    (1..=max.max(1))
+        .rev()
+        .find(|&scale| {
+            let lines = wrap_lines(s, w, scale);
+            lines.len() as i64 * (GLYPH_H + 3) * scale <= h
+        })
+        .unwrap_or(1)
+}
+
+/// `text` centred in a box, broken into lines that fit, each as wide as it
+/// can be. Returns the height it used.
+fn titled(img: &mut RgbaImage, x: i64, y: i64, w: i64, s: &str, scale: i64, c: Rgba<u8>) -> i64 {
+    let lines = wrap_lines(s, w, scale);
     let step = (GLYPH_H + 3) * scale;
     for (i, line) in lines.iter().enumerate() {
         let lx = x + (w - text_width(line, scale)) / 2;
@@ -197,11 +216,55 @@ fn blit(dst: &mut RgbaImage, src: &RgbaImage, x: i64, y: i64) {
     imageops::overlay(dst, src, x, y);
 }
 
+
+/// The 3DO mark, decoded once: the launcher's own artwork, so a title with
+/// no scan still gets a case that is recognisably a 3DO release rather than
+/// a grey rectangle.
+fn mark() -> Option<&'static RgbaImage> {
+    static MARK: OnceLock<Option<RgbaImage>> = OnceLock::new();
+    MARK.get_or_init(|| {
+        image::load_from_memory(include_bytes!("../../../assets/3do-mark.png"))
+            .ok()
+            .map(|img| img.to_rgba8())
+    })
+    .as_ref()
+}
+
+/// The mark laid in at `w` wide, keeping its aspect, tinted to `ink` so it
+/// sits on the panel's own card rather than glaring off it. `x`, `y` are the
+/// top-left of the box it is drawn into.
+fn blit_mark(dst: &mut RgbaImage, x: i64, y: i64, w: u32, ink: Rgba<u8>) -> i64 {
+    let Some(src) = mark() else {
+        return 0;
+    };
+    if src.width() == 0 || w == 0 {
+        return 0;
+    }
+    let h = ((w as f32) * src.height() as f32 / src.width() as f32).round() as u32;
+    let scaled = imageops::resize(src, w.max(1), h.max(1), imageops::FilterType::Lanczos3);
+    // The mark goes on as a stencil rather than a picture: its own
+    // brightness is what decides how much ink lands, so it sits on the
+    // sleeve's card whether the file carries an alpha channel or a solid
+    // background behind the lettering.
+    let mut tinted = scaled;
+    for px in tinted.pixels_mut() {
+        let luma = (px[0] as u32 * 299 + px[1] as u32 * 587 + px[2] as u32 * 114) / 1000;
+        let a = (luma * px[3] as u32 / 255) as u8;
+        *px = Rgba([ink[0], ink[1], ink[2], a]);
+    }
+    imageops::overlay(dst, &tinted, x, y);
+    h as i64
+}
+
 // --- the drawn stand-ins ---------------------------------------------------
 
-/// A cover for a game whose art is not in the folder: the title on graphite
-/// over the 3DO strap, which is at least recognisably a 3DO case.
-fn drawn_cover(w: u32, h: u32, title: &str, strap: &str) -> RgbaImage {
+/// A cover for a game whose art is not in the folder: the 3DO mark over
+/// graphite with the title under it, cut the way the FZ-1 retail sleeves
+/// were — a red rule across the top, the strap and the black foot band. The
+/// back carries the same furniture with a blurb block and a barcode, so a
+/// case with no scans still reads as a boxed 3DO game from either side.
+fn drawn_cover(w: u32, h: u32, title: &str, strap: &str, front: bool) -> RgbaImage {
+    let title = clean_title(title);
     let mut img = RgbaImage::from_pixel(w, h, PAPER);
     let (w64, h64) = (w as i64, h as i64);
     // A little shading so the panel is not a flat block.
@@ -215,24 +278,76 @@ fn drawn_cover(w: u32, h: u32, title: &str, strap: &str) -> RgbaImage {
         ]);
         fill(&mut img, 0, y as i64, w64, 1, shade);
     }
-    let scale = (w64 / 46).max(2);
-    let used = titled(&mut img, w64 / 10, h64 / 3, w64 * 8 / 10, title, scale, INK);
-    fill(&mut img, w64 / 10, h64 / 3 - scale * 6, w64 * 8 / 10, scale.max(2), RULE);
-    // The strap sits just above the bottom band rather than under the
-    // title, which a long title would otherwise run into.
-    let small = (scale / 2).max(1);
-    let _ = used;
-    let y = h64 - h64 / 9 - GLYPH_H * small - small * 8;
-    let sx = w64 / 10 + (w64 * 8 / 10 - text_width(strap, small)) / 2;
-    text(&mut img, sx, y, strap, small, Rgba([150, 152, 160, 255]), false);
-    fill(&mut img, 0, h64 - h64 / 9, w64, h64 / 9, Rgba([16, 17, 20, 255]));
-    let mark = "3DO INTERACTIVE MULTIPLAYER";
+    let band = h64 / 9;
+    let rule = (h64 / 220).max(2);
+    // The red rule across the head of the sleeve.
+    fill(&mut img, 0, band / 3, w64, rule, RULE);
+    let (col, col_w) = (w64 / 10, w64 * 8 / 10);
+    // The strap's own line, which the panels keep clear.
+    let strap_scale = (w64 / 90).max(1);
+    let strap_y = h64 - band - GLYPH_H * strap_scale - h64 / 40;
+    if front {
+        // The mark is the cover: centred, high on the card, with the title
+        // under it in whatever size the title needs to fit the room left.
+        let mark_w = (w64 * 34 / 100) as u32;
+        let mark_h = blit_mark(&mut img, (w64 - mark_w as i64) / 2, h64 / 10, mark_w, INK);
+        let ty = h64 / 10 + mark_h + h64 / 12;
+        let room = strap_y - ty - h64 / 30;
+        let scale = fit_scale(&title, col_w, room, (w64 / 46).max(2));
+        fill(&mut img, col, ty - h64 / 24, col_w, rule, RULE);
+        titled(&mut img, col, ty, col_w, &title, scale, INK);
+    } else {
+        // The back: the title at the head, a blurb block under it, the mark
+        // low on the left and the barcode low on the right.
+        let head = h64 / 4 - band;
+        let scale = fit_scale(&title, col_w, head, (w64 / 70).max(2));
+        titled(&mut img, col, band, col_w, &title, scale, INK);
+        let muted = Rgba([96, 98, 106, 255]);
+        let line_h = (h64 / 150).max(2);
+        let mut y = h64 / 4;
+        for i in 0..9 {
+            let len = col_w - (i % 3) * w64 / 9;
+            fill(&mut img, col, y, len, line_h, muted);
+            y += line_h * 4;
+        }
+        // The barcode: white card, black bars, as every retail back has.
+        let (bw, bh) = (w64 * 26 / 100, h64 / 14);
+        let (bx, by) = (w64 - col - bw, strap_y - bh - h64 / 30);
+        fill(&mut img, bx, by, bw, bh, Rgba([235, 235, 235, 255]));
+        let mut x = bx + bw / 20;
+        let mut seed = 0x9e37u32;
+        while x < bx + bw - bw / 20 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let bar = ((seed >> 16) % 3 + 1) as i64 * (bw / 60).max(1);
+            fill(&mut img, x, by + bh / 10, bar, bh * 8 / 10, Rgba([18, 18, 20, 255]));
+            x += bar + (bw / 50).max(2);
+        }
+        // The mark sits above the barcode's line, so neither it nor the
+        // strap below has anything printed over it.
+        let mark_w = (w64 * 16 / 100) as u32;
+        let mark_h = ((mark_w as i64) * 3) / 2;
+        blit_mark(&mut img, col, by - h64 / 40 - mark_h, mark_w, INK);
+    }
+    // The strap has a line of its own above the foot band, so no title and
+    // no barcode can run into it.
+    let sx = col + (col_w - text_width(strap, strap_scale)) / 2;
+    text(
+        &mut img,
+        sx,
+        strap_y,
+        strap,
+        strap_scale,
+        Rgba([150, 152, 160, 255]),
+        false,
+    );
+    fill(&mut img, 0, h64 - band, w64, band, Rgba([16, 17, 20, 255]));
+    let mark_text = "3DO INTERACTIVE MULTIPLAYER";
     let ms = (w64 / 150).max(1);
     text(
         &mut img,
-        (w64 - text_width(mark, ms)) / 2,
-        h64 - h64 / 9 + (h64 / 9 - GLYPH_H * ms) / 2,
-        mark,
+        (w64 - text_width(mark_text, ms)) / 2,
+        h64 - band + (band - GLYPH_H * ms) / 2,
+        mark_text,
         ms,
         Rgba([205, 207, 214, 255]),
         false,
@@ -323,9 +438,21 @@ fn drawn_spine(w: u32, h: u32, title: &str, paper: Rgba<u8>) -> RgbaImage {
     let (w64, h64) = (w as i64, h as i64);
     fill(&mut img, 0, 0, w64, (h64 / 90).max(2), RULE);
     fill(&mut img, 0, h64 - (h64 / 90).max(2), w64, (h64 / 90).max(2), RULE);
-    // As large as the strip is wide, but stepped down until the whole title
-    // fits down it: on a shelf the spine is all there is to read.
-    let room = h64 - h64 / 12;
+    // The mark at both ends, as a retail spine carries its publisher's: the
+    // shelf then reads as a row of 3DO releases however the titles run.
+    let mark_w = (w64 * 76 / 100).max(1) as u32;
+    let pad = h64 / 44;
+    let mark_h = blit_mark(&mut img, (w64 - mark_w as i64) / 2, pad, mark_w, INK);
+    blit_mark(
+        &mut img,
+        (w64 - mark_w as i64) / 2,
+        h64 - pad - mark_h,
+        mark_w,
+        INK,
+    );
+    // The title lives between the two marks.
+    let head = pad * 2 + mark_h;
+    let room = h64 - head * 2;
     let fits = (room / text_width(title, 1).max(1)).max(1);
     let scale = ((w64 - 4) / GLYPH_H).max(1).min(fits);
     let cut = (room / ((GLYPH_W + 1) * scale)).max(1) as usize;
@@ -412,7 +539,7 @@ pub fn wrap(art: &CaseArt) -> ColorImage {
         .back
         .as_deref()
         .and_then(|p| fit_in(p, cover_w, h))
-        .unwrap_or_else(|| drawn_cover(cover_w, h, &art.title, &strap));
+        .unwrap_or_else(|| drawn_cover(cover_w, h, &art.title, &strap, false));
     let spine = art
         .spine
         .as_deref()
@@ -422,7 +549,7 @@ pub fn wrap(art: &CaseArt) -> ColorImage {
         .front
         .as_deref()
         .and_then(|p| fit_in(p, cover_w, h))
-        .unwrap_or_else(|| drawn_cover(cover_w, h, &art.title, &strap));
+        .unwrap_or_else(|| drawn_cover(cover_w, h, &art.title, &strap, true));
 
     blit(&mut sheet, &back, 0, 0);
     blit(&mut sheet, &spine, cover_w as i64, 0);
@@ -430,6 +557,13 @@ pub fn wrap(art: &CaseArt) -> ColorImage {
     // The model's UVs read the sheet exactly as a sleeve is printed, so it
     // goes on as it stands: back cover, spine, front cover across it.
     to_color(&sheet)
+}
+
+/// A whole spine for a title the media folder has no scan of, as the shelf
+/// wants it: the generic 3DO card, the mark at both ends and the title down
+/// the middle. The shelf asks for this once per title and keeps the texture.
+pub fn generic_spine(w: u32, h: u32, title: &str) -> ColorImage {
+    to_color(&drawn_spine(w, h, title, spine_paper(title)))
 }
 
 /// The label on the disc beside the case.
@@ -494,6 +628,42 @@ mod tests {
     }
 
     #[test]
+    fn the_generic_spine_carries_the_3do_mark() {
+        let strip = generic_spine(128, 1890, "Star Control II");
+        assert_eq!(strip.size, [128, 1890]);
+        let at = |x: usize, y: usize| {
+            strip.pixels.get(y * 128 + x).copied().unwrap_or_default()
+        };
+        // The mark is laid in at both ends, so both have light ink on them.
+        let lit = |band: std::ops::Range<usize>| {
+            band.flat_map(|y| (0..128).map(move |x| at(x, y)))
+                .filter(|p| p.r() > 180)
+                .count()
+        };
+        assert!(lit(20..120) > 100, "no mark at the head of the spine");
+        assert!(lit(1770..1870) > 100, "no mark at the foot of the spine");
+    }
+
+    #[test]
+    fn the_drawn_back_is_not_the_drawn_front() {
+        let front = drawn_cover(420, 640, "Killing Time", "ONE DISC", true);
+        let back = drawn_cover(420, 640, "Killing Time", "ONE DISC", false);
+        assert_ne!(front.as_raw(), back.as_raw());
+        // The back's barcode is a white block low on the right.
+        let barcode = |img: &RgbaImage| {
+            // The barcode's own box, as the back lays it out.
+            (498..543)
+                .flat_map(|y| (269..378).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let p = img.get_pixel(x, y);
+                    p[0] > 220 && p[1] > 220 && p[2] > 220
+                })
+                .count()
+        };
+        assert!(barcode(&back) > 500, "the back has no barcode on it");
+    }
+
+    #[test]
     fn a_spine_title_drops_the_scrapers_tags() {
         assert_eq!(clean_title("Killing Time (USA) (RE1)"), "Killing Time");
         assert_eq!(
@@ -510,3 +680,4 @@ mod tests {
         );
     }
 }
+
