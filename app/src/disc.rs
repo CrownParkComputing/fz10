@@ -560,6 +560,16 @@ impl Disc {
         if self.chd.is_chd {
             return self.open_chd(file, name);
         }
+        // A file named .chd that does not probe as one is a broken dump, not a
+        // raw image in disguise. Serving its bytes as sectors leaves the BIOS
+        // re-reading a label that can never make sense; saying so up front is
+        // the difference between "corrupt image" and "machine hung on boot".
+        if lowercase_extension(name) == ".chd" {
+            self.last_error = format!(
+                "File claims to be a CHD but does not contain one (corrupt dump?): {name}"
+            );
+            return false;
+        }
 
         self.layout = detect_layout(&mut file);
         let size = file_size(&mut file);

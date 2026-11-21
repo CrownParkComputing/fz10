@@ -482,3 +482,22 @@ fn a_cue_opens_the_image_beside_it_and_reports_that_path() {
     assert!(disc.path().is_empty());
     assert!(disc.tracks().is_empty());
 }
+
+#[test]
+fn a_file_named_chd_that_is_not_one_is_refused() {
+    // Compressed bytes passed off as a disc would read back as a label the
+    // BIOS can never make sense of - it retries the mount for ever, which
+    // looks exactly like a machine hung on the boot logo. Refusing at open
+    // turns that into "corrupt image", which is what it is.
+    let scratch = Scratch::new("fake-chd");
+    let mut garbage = vec![0xa5u8; 1 << 20];
+    for (i, b) in garbage.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2654435761) as u8;
+    }
+    let path = scratch.write("not-a-chd.chd", &garbage);
+
+    let mut disc = Disc::new();
+    assert!(!disc.open(&path));
+    assert!(disc.last_error().contains("does not contain one"));
+    assert!(!disc.is_open());
+}

@@ -2216,7 +2216,12 @@ impl GuiApp {
     }
 
     /// Ask a worker for the platter picture; it comes back on `slot_rx`.
-    fn request_platter(&self, art: PathBuf) {
+    /// Whatever the slot showed until now is stale, so the part it dresses
+    /// hides until the new picture lands.
+    fn request_platter(&mut self, art: PathBuf) {
+        if let Some(r) = self.fz1.as_mut() {
+            r.clear_art(fz1_3d::ArtSlot::Platter);
+        }
         let tx = self.slot_tx.clone();
         std::thread::spawn(move || {
             let key = art.to_string_lossy().into_owned();
@@ -2242,8 +2247,12 @@ impl GuiApp {
     }
 
     /// Ask a worker to dress the case for `index`: the printed sleeve and
-    /// the disc in it.
-    fn request_case_art(&self, index: usize) {
+    /// the disc in it. The slot keeps another game's sleeve until then, so
+    /// the case stays out of sight rather than wearing the wrong cover.
+    fn request_case_art(&mut self, index: usize) {
+        if let Some(r) = self.fz1.as_mut() {
+            r.clear_art(fz1_3d::ArtSlot::Wrap);
+        }
         let Some(game) = self.games.get(index) else {
             return;
         };

@@ -606,6 +606,11 @@ pub struct Fz1Renderer {
     /// The game-dependent pictures, by `ArtSlot` order, and every baked
     /// image the models carry (kept alive for their bind groups).
     slots: Vec<wgpu::Texture>,
+    /// Which slots hold real artwork. A slot starts grey until the GUI's
+    /// first `set_art`, and a part bound to an unwritten slot is never
+    /// drawn: a case or disc on screen already wears its artwork, or it is
+    /// not on screen at all.
+    slots_ready: Vec<bool>,
     _baked: Vec<wgpu::Texture>,
 }
 
@@ -950,6 +955,7 @@ impl Fz1Renderer {
             parts: scene,
             targets: Vec::new(),
             points: Vec::new(),
+            slots_ready: vec![false; slots.len()],
             slots,
             _baked: baked,
         })
@@ -963,6 +969,24 @@ impl Fz1Renderer {
         }
         if let Some(tex) = self.slots.get(slot as usize) {
             write_rgba(&state.queue, tex, rgba, w, h);
+        }
+        if let Some(ready) = self.slots_ready.get_mut(slot as usize) {
+            *ready = true;
+        }
+    }
+
+    /// Whether a slot holds real artwork — false until its first `set_art`,
+    /// and again after `clear_art` marks it stale while a new picture is on
+    /// its way.
+    pub fn art_ready(&self, slot: ArtSlot) -> bool {
+        self.slots_ready.get(slot as usize).copied().unwrap_or(false)
+    }
+
+    /// Mark a slot stale: whatever it shows is not the artwork being asked
+    /// for, so the parts it dresses go back to hidden until `set_art` lands.
+    pub fn clear_art(&mut self, slot: ArtSlot) {
+        if let Some(ready) = self.slots_ready.get_mut(slot as usize) {
+            *ready = false;
         }
     }
 
@@ -1217,7 +1241,20 @@ impl Fz1Renderer {
             });
             pass.set_pipeline(&self.pipeline);
             for (gpu_parts, m) in self.parts.iter().skip(first).zip(models.iter()) {
+                // A case without its sleeve is a bare prop, not a case: the
+                // whole model waits for the artwork rather than flashing a
+                // blank.
+                if m.kind == Kind::Case && !self.art_ready(ArtSlot::Wrap) {
+                    continue;
+                }
                 for (gpu, part) in gpu_parts.iter().zip(m.parts.iter()) {
+                    // A part dressed by a game slot only exists once the art
+                    // for it has actually landed.
+                    if let Some(slot) = ArtSlot::of_material(&part.material) {
+                        if !self.art_ready(slot) {
+                            continue;
+                        }
+                    }
                     let Some(world) = world_of(m, part) else {
                         continue;
                     };
@@ -1272,7 +1309,15 @@ impl Fz1Renderer {
         // Remember where each part landed, for the caller's click targets.
         self.points.clear();
         for m in models.iter() {
+            if m.kind == Kind::Case && !self.art_ready(ArtSlot::Wrap) {
+                continue;
+            }
             for part in &m.parts {
+                if let Some(slot) = ArtSlot::of_material(&part.material) {
+                    if !self.art_ready(slot) {
+                        continue;
+                    }
+                }
                 let Some(world) = world_of(m, part) else {
                     continue;
                 };
