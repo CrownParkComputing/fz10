@@ -3619,7 +3619,8 @@ impl GuiApp {
     /// Play the RETRO3DO_SCRIPT automation: `secs:action` entries, where an
     /// action is `shot:NAME` (window screenshot into RETRO3DO_SHOT_DIR),
     /// `case:GAME`, `load:GAME` (GAME an index or part of a title), `esc`,
-    /// `eject`, `click` (skip the show running) or `close`.
+    /// `eject`, `click` (skip the show running) or `close`. `key` pushes a
+    /// key press into egui, waking the chrome the way a real touch does.
     fn run_script(&mut self, ctx: &egui::Context) {
         let shots: Vec<std::sync::Arc<ColorImage>> = ctx.input(|i| {
             i.events
@@ -3679,6 +3680,26 @@ impl GuiApp {
                         self.frontend = false;
                         self.emu.set_paused(false);
                     }
+                }
+                "key" => {
+                    // A key press pushed into egui, so the chrome's wake on
+                    // input can be exercised without a person at the
+                    // keyboard. It goes into the event list only: the pad
+                    // reads the key state, not the events, so the game does
+                    // not see it.
+                    let key = match arg {
+                        "escape" => egui::Key::Escape,
+                        _ => egui::Key::Space,
+                    };
+                    ctx.input_mut(|i| {
+                        i.events.push(egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Default::default(),
+                        });
+                    });
                 }
                 "click" => {
                     if self.load.is_some() {

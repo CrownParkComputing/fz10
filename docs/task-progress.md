@@ -211,3 +211,11 @@ Verified in the real window (RETRO3DO_SCRIPT, ~/.cache/r3tmp/shots-ui{,2}):
 the shelf back after the eject cancels the load ("load cancelled - the disc
 came out"); `live.png`/`live2.png` the game picture with no chrome. 24 GUI
 tests pass.
+
+The marks also wake on input like the rest of the chrome. New script verb
+`key` pushes a key press into egui's event list (the pad reads the key
+state, not the events, so the game does not see it) — xdotool/ydotool never
+reach the window on this box. Verified in the real window
+(~/.cache/r3tmp/shots-ui5): `hidden.png` the game with a bare window,
+`woken.png` a second after the key the eject mark, the hamburger and the cog
+are back, `slept.png` five seconds on they are gone again.
