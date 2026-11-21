@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use egui::ColorImage;
 use image::{imageops, Rgba, RgbaImage};
 
-use crate::fz1_3d::{WRAP_TEX_H, WRAP_TEX_W};
+use super::fz1_3d::{WRAP_TEX_H, WRAP_TEX_W};
 
 /// The platter canvas, which has to match the model's disc texture.
 pub const DISC_TEX: u32 = 1024;

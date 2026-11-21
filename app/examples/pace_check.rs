@@ -107,7 +107,7 @@ fn main() -> Result<(), String> {
     let underruns = emu.audio().underruns();
     let refused = emu.audio().refused();
 
-    let warm_ns = warmup as u64 * 1_000_000_000;
+    let warm_ns = warmup * 1_000_000_000;
     let mut iv: Vec<f64> = publish_times
         .windows(2)
         .filter(|w| w[0] >= warm_ns)
