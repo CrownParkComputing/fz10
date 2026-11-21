@@ -88,6 +88,55 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, hint: &str) -> bool {
     press.on_hover_text(hint).clicked()
 }
 
+/// The pair of disc marks: an arrow over the tray's bar. Eject points up and
+/// out of the tray, insert points down and into it — the same mark turned
+/// around, drawn rather than typed so the two are unmistakably a pair.
+fn tray_icon(ui: &mut egui::Ui, insert: bool, hint: &str) -> bool {
+    let size = egui::vec2(34.0, 34.0);
+    let (spot, press) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hot = press.hovered();
+    ui.painter().rect_filled(
+        spot,
+        6.0,
+        egui::Color32::from_black_alpha(if hot { 220 } else { 150 }),
+    );
+    let ink = if hot { egui::Color32::WHITE } else { TEXT_DIM };
+    let cx = spot.center().x;
+    // The tray: a bar the arrow sits over.
+    let bar = spot.max.y - 9.0;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(egui::pos2(cx - 8.0, bar), egui::pos2(cx + 8.0, bar + 2.0)),
+        0.0,
+        ink,
+    );
+    // The arrow, in the same space either way round.
+    let top = spot.min.y + 7.0;
+    let (apex, base) = if insert {
+        (bar - 2.0, bar - 8.0)
+    } else {
+        (top, top + 6.0)
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(cx, apex),
+            egui::pos2(cx - 4.5, base),
+            egui::pos2(cx + 4.5, base),
+        ],
+        ink,
+        egui::Stroke::NONE,
+    ));
+    let stem = if insert {
+        egui::Rect::from_min_max(egui::pos2(cx - 1.5, top), egui::pos2(cx + 1.5, base))
+    } else {
+        egui::Rect::from_min_max(egui::pos2(cx - 1.5, base), egui::pos2(cx + 1.5, bar - 2.0))
+    };
+    ui.painter().rect_filled(stem, 0.0, ink);
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    press.on_hover_text(hint).clicked()
+}
+
 /// Ease in and out of 0..1.
 fn smoothstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -2821,11 +2870,8 @@ impl GuiApp {
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             ui.horizontal_centered(|ui| {
-                let insert = egui::Button::new(egui::RichText::new("▶  Insert disc").size(15.0))
-                    .fill(egui::Color32::from_rgb(40, 90, 60));
-                if ui.add(insert).clicked() {
-                    self.start_load(index);
-                }
+                // Putting the disc in is the floating insert mark in the
+                // corner now, paired with the eject one.
                 if ui.button(egui::RichText::new("✕  Back").size(15.0)).clicked() {
                     self.case_open = None;
                 }
@@ -3259,9 +3305,19 @@ impl GuiApp {
         let strip = egui::Rect::from_min_max(egui::pos2(area.min.x, area.max.y - shelf_h), area.max);
         // The shelf comes in as the machine settles out of its box, and
         // goes as it is packed away.
-        let alpha = match self.closing {
-            Some(c) => 1.0 - (c * 4.0).min(1.0),
-            None => ((self.settled_for - SHELF_WAIT) / SHELF_FADE).clamp(0.0, 1.0),
+        // A disc on its way in means the machine is booting, and a machine
+        // that is on with a disc in it is past booting into the game: either
+        // way the shelf goes away entirely. It only comes back when the
+        // launcher is asked for over a running game (the choosing state) or
+        // when an eject cancels the boot and drops back to the library.
+        let booting = self.load.is_some() || (self.emu.running() && !self.frontend);
+        let alpha = if booting {
+            0.0
+        } else {
+            match self.closing {
+                Some(c) => 1.0 - (c * 4.0).min(1.0),
+                None => ((self.settled_for - SHELF_WAIT) / SHELF_FADE).clamp(0.0, 1.0),
+            }
         };
         // While the carton is still turning and the machine is coming out of
         // it, there is no shelf, so the show gets the whole window: the scene
@@ -3370,9 +3426,7 @@ impl GuiApp {
                     if ui.button("⚙  Settings").clicked() {
                         self.open_settings();
                     }
-                    if ui.button("⏏  Eject").clicked() {
-                        self.eject();
-                    }
+                    // Ejecting is the floating mark in the corner now.
                     if ui.button("✕  Power off").clicked() {
                         self.power_off();
                     }
@@ -4189,12 +4243,24 @@ impl GuiApp {
     fn chrome_icons(&mut self, ctx: &egui::Context) {
         let mut menu = false;
         let mut cog = false;
+        let mut insert = false;
+        let mut eject = false;
+        // The case on show is the disc the insert mark puts in; the machine
+        // has something in it when a disc is loaded or one is on its way.
+        let case = self.case_open;
+        let loaded = self.emu.disc_loaded() || self.load.is_some();
         egui::Area::new(egui::Id::new("chrome-icons"))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    if case.is_some() {
+                        insert = tray_icon(ui, true, "Put the disc in");
+                    }
+                    if loaded {
+                        eject = tray_icon(ui, false, "Take the disc out");
+                    }
                     menu = icon_button(ui, "\u{2630}", "The menu");
                     cog = icon_button(ui, "\u{2699}", "Settings");
                 });
@@ -4204,6 +4270,14 @@ impl GuiApp {
         }
         if cog {
             self.open_settings();
+        }
+        if insert {
+            if let Some(index) = case {
+                self.start_load(index);
+            }
+        }
+        if eject {
+            self.eject();
         }
     }
 

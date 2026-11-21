@@ -56,8 +56,7 @@ Tree left dirty (standing instruction: nothing committed without approval).
 - Verified: /tmp/unbox/sheet.png (offscreen, tray=1 at u=0.70/0.78 shows no
   drawer) and the real window /tmp/win/{a..d}.png.
 
-## 6. Eject, drawer travel, shelf, header, settings page — code done, UNVERIFIED
-Compiles clean (no warnings). Not yet run in the real window.
+## 6. Eject, drawer travel, shelf, header, settings page — DONE, verified
 - fz1_3d.rs: `TRAY_TRAVEL = 0.150` m (was 0.13) — the platter's rear edge now
   passes the front face, so a CD drops on flat. Camera pull-back 0.15→0.24·open.
 - gui: `toggle_tray()`/`eject()` — OPEN/CLOSE during a load cancels it; while
@@ -181,3 +180,34 @@ System gained the BIOS choice (it only lived in the first-run walkthrough
 before) beside the CPU overclock.
 
 New script verbs: `settings-back`, `section:<name>`.
+
+Verified in the real window (RETRO3DO_SCRIPT, /tmp/s9): `settings` opens the
+page over the launcher — `‹ Back` + "Settings" top bar, the four sections
+listed down the left, the active one lit. `section:Video/Paths/System` each
+swap the right-hand column and only it (`ctrl.png`..`system.png`).
+`settings-back` returns to the shelf (`back-shelf.png`), and opened over a
+loading game it returns to the machine view it came from (`back-game.png`);
+the last-visited tab persists between opens. `cargo test` 390 pass, clippy
+clean.
+
+## 7. Shelf hidden during boot; insert/eject as floating marks — DONE, verified
+- `view_machine()`: the shelf's alpha is forced to 0 while a disc is on its way
+  in (`load.is_some()`) or the machine is on with a disc in it
+  (`emu.running() && !frontend`). It comes back only in the choosing state
+  (menu open over a running game) or after an eject cancels the boot.
+- `tray_icon()` (new, beside `icon_button`): the disc marks are drawn, not
+  typed — an arrow over the tray's bar, up and out to eject, down and into it
+  to insert, the same mark turned around.
+- The floating corner (`chrome_icons`) now carries insert and eject beside the
+  hamburger and the cog: insert when a case is open, eject when a disc is
+  loaded or loading. The "▶ Insert disc" button in the case view and the
+  "⏏ Eject" button in the frontend row are gone; the marks do both jobs.
+- The marks follow the old auto-hide rule: hidden once the game has the
+  window, back on the next touch.
+
+Verified in the real window (RETRO3DO_SCRIPT, ~/.cache/r3tmp/shots-ui{,2}):
+`library.png` shelf + menu/cog only; `case.png` the insert mark in the corner;
+`boot.png`/`boot2.png` no shelf at all, the eject mark showing; `eject.png`
+the shelf back after the eject cancels the load ("load cancelled - the disc
+came out"); `live.png`/`live2.png` the game picture with no chrome. 24 GUI
+tests pass.
