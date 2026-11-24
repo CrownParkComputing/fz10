@@ -1,0 +1,17 @@
+A spryte is what the 3DO called the thing it drew. Not a rectangle stamped onto the screen, but a picture mapped corner by corner onto any four points you choose — which is how games in 1993 scaled, turned and threw sprites around a machine that had no 3D pipeline to do it for them. Getting that one operation right is most of what this app is, so it is what the app is called.
+
+Spryte runs 3DO Interactive Multiplayer software on iPhone and iPad.
+
+It opens on a shelf. Everything you can play is a tile, and tapping one starts it. There is no library to configure, no folder to point at, no account and no sign-in anywhere in it.
+
+The first tile is a demonstration written for this app, and it asks nothing of you — no disc, no system ROM, no setup. It puts the machine through its own paces: the ARM60 processor, the MADAM and CLIO chips, the display hardware, the sound and the controller, each reporting as it passes. Then it hands you a marker to move around with the pad.
+
+To add your own, choose the + tile. The document picker opens on Files, you pick a disc image or a system ROM, and it is brought in and becomes a tile. Spryte reads the file to decide what it is rather than trusting the name on it, and a disc is titled from the volume label written on the disc itself, not from your filename. Imported files are copied, so they keep working after you move or delete the original.
+
+Play with the on-screen pad or a game controller. Drag the on-screen controls to where your thumbs actually sit and the arrangement is kept. The console's saved RAM is shared across your games, written as you play, and preserved when the app updates.
+
+Underneath: the ARM60 processor, the MADAM and CLIO chipsets, the video display list, DSP audio, the daisy-chained controller bus, and CD media including CHD images. Instructions are decoded once and cached rather than picked apart every time they run, and emulation never waits on the screen to finish drawing — so a slow frame costs you a frame rather than stalling the machine.
+
+Spryte contains no system ROM and no games, and it cannot fetch them. Bring images of discs you own.
+
+Spryte is not affiliated with, endorsed by, or connected to The 3DO Company, Panasonic, or any rights holder in 3DO hardware, software or trade marks.

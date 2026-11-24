@@ -1,0 +1,1 @@
+Retro-3DO 2.2.0 targets Android 16 (API 36). New setup wizard finds games and BIOS folders automatically. Arrange the on-screen controls even with a controller connected. BIOS files no longer appear as games. Saved RAM is kept in your library’s saves folder, with existing saves preserved. Fixed remembered browse locations and Resume availability.
