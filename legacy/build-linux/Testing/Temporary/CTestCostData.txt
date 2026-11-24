@@ -1,0 +1,4 @@
+retro3do_tests 1 0.188941
+retro3do_touch_tests 1 0.00157579
+retro3do_storage_tests 1 0.0405855
+---

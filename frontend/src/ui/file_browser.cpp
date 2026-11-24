@@ -1,0 +1,380 @@
+#include "file_browser.h"
+
+#include <SDL3/SDL.h>
+
+#include <algorithm>
+#include <cctype>
+
+#include "imgui.h"
+#include "platform/android_storage.h"
+#include "platform/storage.h"
+
+namespace retro3do {
+namespace {
+
+std::string lowercased(const std::string& text) {
+    std::string out = text;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+bool has_extension(const std::string& name,
+                   const std::vector<std::string>& extensions) {
+    if (extensions.empty()) {
+        return true;
+    }
+    const std::string lower = lowercased(name);
+    for (const std::string& ext : extensions) {
+        if (lower.size() >= ext.size() &&
+            lower.compare(lower.size() - ext.size(), ext.size(), ext) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// SDL hands each entry to this callback as it walks the directory.
+struct EnumerationState {
+    std::vector<std::pair<std::string, bool>> entries;
+};
+
+SDL_EnumerationResult SDLCALL on_entry(void* userdata, const char* directory,
+                                       const char* name) {
+    auto* state = static_cast<EnumerationState*>(userdata);
+
+    // Skip dotfiles: on Android especially, shared storage is full of them and
+    // none are ever a disc image.
+    if (name == nullptr || name[0] == '.') {
+        return SDL_ENUM_CONTINUE;
+    }
+
+    SDL_PathInfo info;
+    const std::string full = Storage::join(directory, name);
+    bool is_directory = false;
+    if (SDL_GetPathInfo(full.c_str(), &info)) {
+        is_directory = info.type == SDL_PATHTYPE_DIRECTORY;
+    }
+    state->entries.emplace_back(name, is_directory);
+    return SDL_ENUM_CONTINUE;
+}
+
+}  // namespace
+
+void FileBrowser::open_folder(const std::string& title) {
+    // Every extension the machine can mount, shown but not selectable, so the
+    // user can see they are standing in the right folder before accepting it.
+    open(title, {".iso", ".chd", ".img", ".cue", ".bin"});
+    choosing_folder_ = true;
+}
+
+void FileBrowser::open(const std::string& title,
+                       std::vector<std::string> extensions,
+                       const std::string& remembered_file,
+                       const std::string& fallback_folder,
+                       const std::vector<std::string>& preferred_subfolders) {
+    disc_images_only_ = false;
+    open_impl(title, std::move(extensions), remembered_file, fallback_folder,
+              preferred_subfolders);
+}
+
+void FileBrowser::open_disc(const std::string& title, const std::string& remembered_file,
+                             const std::string& library_folder) {
+    disc_images_only_ = true;
+    const std::string remembered = !remembered_file.empty() && Storage::is_system_rom(remembered_file)
+        ? std::string() : remembered_file;
+    open_impl(title, {".iso", ".bin", ".cue", ".img", ".chd"}, remembered,
+              library_folder, {"games", "discs"});
+}
+
+void FileBrowser::open_impl(const std::string& title,
+                            std::vector<std::string> extensions,
+                            const std::string& remembered_file,
+                            const std::string& fallback_folder,
+                            const std::vector<std::string>& preferred_subfolders) {
+    open_ = true;
+    choosing_folder_ = false;
+    title_ = title;
+    extensions_ = std::move(extensions);
+    for (std::string& ext : extensions_) {
+        ext = lowercased(ext);
+    }
+
+    using_documents_ = AndroidStorage::available();
+
+    if (using_documents_) {
+        const std::vector<DocumentEntry> roots = AndroidStorage::granted_roots();
+        directory_ = remembered_file.empty() ? std::string()
+            : AndroidStorage::parent_folder(remembered_file);
+        const bool using_fallback = directory_.empty();
+        if (directory_.empty()) directory_ = fallback_folder;
+        if (directory_.empty() && !roots.empty()) directory_ = roots.front().uri;
+        entries_.clear();
+        error_.clear();
+        if (!directory_.empty()) {
+            navigate_to(directory_);
+            if (using_fallback) prefer_subfolder(preferred_subfolders);
+        }
+        return;
+    }
+
+    const std::string remembered_folder = Storage::is_directory(remembered_file)
+        ? remembered_file : Storage::parent_of(remembered_file);
+    if (!remembered_folder.empty() && Storage::is_directory(remembered_folder)) {
+        navigate_to(remembered_folder);
+        return;
+    }
+    if (!fallback_folder.empty() && Storage::is_directory(fallback_folder)) {
+        navigate_to(fallback_folder);
+        prefer_subfolder(preferred_subfolders);
+        return;
+    }
+    const std::vector<StorageLocation> roots = Storage::browse_roots();
+    navigate_to(roots.empty() ? std::string("/") : roots.front().path);
+}
+
+void FileBrowser::prefer_subfolder(const std::vector<std::string>& names) {
+    for (const std::string& name : names) {
+        for (const Entry& entry : entries_) {
+            if (!entry.is_directory || lowercased(entry.name) != lowercased(name)) continue;
+            // SAF supplies the actual child URI; it cannot be joined as a path.
+            const std::string target = using_documents_ ? entry.uri
+                : Storage::join(directory_, entry.name);
+            navigate_to(target);
+            return;
+        }
+    }
+}
+
+void FileBrowser::close() {
+    open_ = false;
+    entries_.clear();
+    error_.clear();
+}
+
+bool FileBrowser::accepts_entry(const std::string& name, const std::string& target,
+                                 bool is_directory) const {
+    const std::string lower = lowercased(name);
+    if (is_directory) {
+        return !disc_images_only_ || (lower != "bios" && lower != "saves");
+    }
+    if (!has_extension(name, extensions_)) return false;
+    return !disc_images_only_ ||
+        (lower != "nvram.bin" && !Storage::is_system_rom(target));
+}
+
+void FileBrowser::navigate_to(const std::string& directory) {
+    directory_ = directory;
+    entries_.clear();
+    error_.clear();
+
+    if (using_documents_) {
+        for (const DocumentEntry& child : AndroidStorage::list(directory)) {
+            if (accepts_entry(child.name, child.uri, child.is_directory)) {
+                entries_.push_back(Entry{child.name, child.is_directory, child.uri});
+            }
+        }
+        // The Java side has already sorted folders before files.
+        if (entries_.empty()) {
+            error_ = "Nothing here that this app can open.";
+        }
+        return;
+    }
+
+    EnumerationState state;
+    if (!SDL_EnumerateDirectory(directory.c_str(), on_entry, &state)) {
+        // A directory that cannot be read is normal on mobile — shared storage
+        // needs a permission the app may not have been granted. Say so plainly
+        // rather than showing an empty list that looks like an empty folder.
+        error_ = std::string("Cannot read this folder: ") + SDL_GetError();
+        return;
+    }
+
+    for (auto& entry : state.entries) {
+        if (accepts_entry(entry.first, Storage::join(directory, entry.first), entry.second)) {
+            entries_.push_back(Entry{entry.first, entry.second, std::string()});
+        }
+    }
+
+    // Directories first, then files, each alphabetically — the order people
+    // expect, and it puts the folders you are looking for at the top.
+    std::sort(entries_.begin(), entries_.end(), [](const Entry& a, const Entry& b) {
+        if (a.is_directory != b.is_directory) return a.is_directory;
+        return lowercased(a.name) < lowercased(b.name);
+    });
+}
+
+bool FileBrowser::draw(std::string* chosen_path, std::string* chosen_name) {
+    if (!open_) {
+        return false;
+    }
+
+    bool chose = false;
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+               viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(
+        ImVec2(viewport->WorkSize.x * 0.94f, viewport->WorkSize.y * 0.92f),
+        ImGuiCond_Always);
+
+    if (ImGui::Begin(title_.c_str(), &open_,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoScrollbar)) {
+        // Choosing a folder means accepting where you are standing, so the
+        // button goes first: the user walks into a folder and presses it.
+        if (choosing_folder_ && !directory_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.08f, 0.35f, 0.39f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.11f, 0.47f, 0.52f, 1.0f));
+            const bool accept = ImGui::Button("USE THIS FOLDER", ImVec2(-1.0f, 42.0f));
+            ImGui::PopStyleColor(2);
+            if (accept) {
+                if (chosen_path != nullptr) *chosen_path = directory_;
+                if (chosen_name != nullptr) {
+                    const size_t slash = directory_.find_last_of("/\\");
+                    *chosen_name = slash == std::string::npos
+                                       ? directory_
+                                       : directory_.substr(slash + 1);
+                }
+                open_ = false;
+                choosing_folder_ = false;
+                ImGui::End();
+                return true;
+            }
+            ImGui::TextDisabled("%s", directory_.c_str());
+            ImGui::Separator();
+        }
+        const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        bool first_root = true;
+        auto wrap_root = [&](const char* label) {
+            const float button_width = ImGui::CalcTextSize(label).x +
+                                       ImGui::GetStyle().FramePadding.x * 2.0f;
+            if (!first_root && ImGui::GetItemRectMax().x +
+                ImGui::GetStyle().ItemSpacing.x + button_width <= right)
+                ImGui::SameLine();
+            first_root = false;
+        };
+        if (using_documents_) {
+            // Only folders the user has explicitly granted. The app asks for
+            // these one at a time rather than for access to everything, so what
+            // it can see is always exactly what was handed to it.
+            const std::vector<DocumentEntry> roots = AndroidStorage::granted_roots();
+            for (const DocumentEntry& root : roots) {
+                wrap_root(root.name.c_str());
+                ImGui::PushID(root.uri.c_str());
+                if (ImGui::Button(root.name.c_str())) {
+                    navigate_to(root.uri);
+                }
+                ImGui::PopID();
+            }
+            wrap_root("+ Add folder");
+            if (ImGui::Button("+ Add folder")) {
+                AndroidStorage::pick_folder();
+            }
+
+            if (roots.empty()) {
+                ImGui::Spacing();
+                ImGui::TextWrapped(
+                    "No folders yet. Choose \"Add folder\" and pick the folder "
+                    "your discs are in. This app only ever sees the folders you "
+                    "hand it.");
+            }
+        } else {
+            for (const StorageLocation& root : Storage::browse_roots()) {
+                wrap_root(root.label.c_str());
+                ImGui::PushID(root.path.c_str());
+                if (ImGui::Button(root.label.c_str())) {
+                    navigate_to(root.path);
+                }
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::Separator();
+        if (!using_documents_) {
+            ImGui::TextWrapped("%s", directory_.c_str());
+            ImGui::Separator();
+        }
+
+        // Going up is filesystem-only: a SAF document URI carries no parent
+        // that can be derived from the string, and walking back up out of a
+        // granted tree is exactly what scoped access is meant to prevent.
+        if (!using_documents_) {
+            const std::string parent = Storage::parent_of(directory_);
+            ImGui::BeginDisabled(parent.empty());
+            if (ImGui::Button("Up")) {
+                navigate_to(parent);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Cancel")) {
+            close();
+            ImGui::End();
+            return false;
+        }
+
+        ImGui::Separator();
+
+        if (!error_.empty()) {
+            ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1.0f), "%s",
+                               error_.c_str());
+        }
+
+        // A tall touch-friendly list. Selectable rows rather than tree nodes:
+        // a finger needs a big target, and there is nothing to expand.
+        ImGui::BeginChild("entries", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_NoScrollbar);
+        for (const Entry& entry : entries_) {
+            const std::string label = entry.name + (entry.is_directory ? "/" : "");
+            const ImVec2 padding = ImGui::GetStyle().FramePadding;
+            const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x - padding.x * 2);
+            const float height = std::max(ImGui::GetFrameHeight(),
+                ImGui::CalcTextSize(label.c_str(), nullptr, false, width).y + padding.y * 2);
+            ImGui::PushID(entry.name.c_str());
+            const bool selected = ImGui::Selectable("##entry", false, 0, ImVec2(0, height));
+            if (ImGui::IsItemVisible()) {
+                const ImVec2 top = ImGui::GetItemRectMin();
+                const ImU32 colour = entry.is_directory ? IM_COL32(70, 210, 225, 255)
+                                                       : ImGui::GetColorU32(ImGuiCol_Text);
+                ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(top.x + padding.x, top.y + padding.y), colour,
+                    label.c_str(), nullptr, width);
+            }
+            ImGui::PopID();
+            if (selected) {
+                const std::string target = using_documents_ ? entry.uri
+                    : Storage::join(directory_, entry.name);
+                if (entry.is_directory) {
+                    navigate_to(target);
+                } else if (!choosing_folder_) {
+                    *chosen_path = target;
+                    if (chosen_name != nullptr) *chosen_name = entry.name;
+                    chose = true;
+                }
+                // A file tapped while choosing a folder does nothing on
+                // purpose: the files are there to confirm you are in the right
+                // place, and silently accepting one instead would be worse
+                // than ignoring the tap.
+                // Navigation replaces entries_; never advance an invalidated iterator.
+                break;
+            }
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+
+    if (chose) {
+        close();
+    }
+    if (!open_) {
+        entries_.clear();
+    }
+    return chose;
+}
+
+}  // namespace retro3do

@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/jon/retro3do-ios/build-linux/cmake_install.cmake",
+		"/home/jon/retro3do-ios/build-linux/third_party/libchdr/cmake_install.cmake",
+		"/home/jon/retro3do-ios/build-linux/third_party/libchdr/deps/lzma-26.02/cmake_install.cmake",
+		"/home/jon/retro3do-ios/build-linux/third_party/libchdr/deps/miniz-3.1.2/cmake_install.cmake",
+		"/home/jon/retro3do-ios/build-linux/third_party/libchdr/deps/zstd-1.5.7/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
