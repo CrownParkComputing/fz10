@@ -25,7 +25,7 @@ Read these before redistributing or shipping anything built from this tree:
   emulator source is present here, with the commands to re-run them.
 - [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md) — vendored code, dependencies and
   art, with their licences. No unresolved items.
-- [LICENSE](LICENSE) — MIT, covering Crown Park Computing's own work only.
+- [LICENSE](LICENSE) — proprietary, all rights reserved; copying or use requires written authorization from Crown Park Computing.
 
 No retail BIOS, game or disc image is included or required to build. The
 bundled demonstration ROM is Crown Park Computing's own hardware self-test and
