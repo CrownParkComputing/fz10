@@ -3,8 +3,8 @@
 This crate is an emulation core rather than a game, so its "mechanics" are the
 clocks, sizes and policies that decide how the emulated 3DO behaves.
 
-The original "program" is the person's C++ core in `cpp-reference/`, which is
-source only. To read it as a program, it was built here unchanged (CMake,
+The original "program" is the person's C++ core (the `cpp-reference/` tree,
+removed from this repository on 2026-11-24), which is source only. To read it as a program, it was built here unchanged (CMake,
 Release) and the two resulting executables were opened and decompiled with
 Craft Anything (Ghidra and the built-in lifter):
 
@@ -47,7 +47,7 @@ matches the Rust implementation; nothing on this sheet is estimated.
 | Internal cel resolution (Rust-only addition) | 1 (default, native) to 4; output (640·k) × (480·k) / (640·k) × (576·k) | not in the reference: a project addition, `retro3do_set_internal_scale` | `hires::MAX_INTERNAL_SCALE`, `Console::set_internal_scale` |
 | Hi-res mirrors kept | 4 surfaces, least recently used dropped first; VRAM change pages of 4096 bytes | project choice | `hires::MAX_SURFACES`, `memory::VramWatch::PAGE_BYTES` |
 | Hi-res helper thread | a cel list recording 4096 hi-res jobs moves to a helper thread; jobs go over in batches of 4096, 32 batches kept for reuse; a job is 24 bytes | project choice, tuned on Need for Speed | `HIRES_WORKER_THRESHOLD`, `HIRES_BATCH`, `HIRES_POOL` in `madam` |
-| GUI preset → internal scale | Original 1, 2K 2, 4K 4, 8K 4 (GPU pass takes 4× the rest of the way) | the person's design | `RES_PRESETS` in the GUI |
+| GUI internal scale | settings slider, 1–4×; 2× is the default enhanced picture | the person's design | `internal_scale` in the GUI settings |
 
 ## Controllers
 
@@ -87,7 +87,7 @@ matches the Rust implementation; nothing on this sheet is estimated.
 |---|---|---|---|
 | BIOS load | refuse empty or larger than the 1 MB window; zero the window, copy, mark loaded | `Bus::load_bios` @0x88610 (core_tests) | `Memory::load_rom` |
 | NVRAM | 32 KB, formatted image restored by `Bus::format_nvram` @0x88420; restore needs exact size (`Bus::restore_nvram` @0x884f0) | core_tests | `Memory::format_nvram`, `restore_nvram` |
-| Memory map | 2 MB DRAM, 1 MB VRAM at `0x200000`, ROM at `0x3000000` | `cpp-reference/core/bus.h` | `memory.rs` |
+| Memory map | 2 MB DRAM, 1 MB VRAM at `0x200000`, ROM at `0x3000000` | the retired `cpp-reference/core/bus.h` | `memory.rs` |
 
 ## Controls (pad bit order, as the C ABI numbers them)
 

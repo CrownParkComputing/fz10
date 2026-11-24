@@ -65,7 +65,11 @@ pub fn source_fnv(width: u32, height: u32, texel: impl Fn(u32, u32) -> (u16, boo
             let (color, transparent) = texel(x, y);
             // The position bit is presentation state, not content: the same
             // sprite must fingerprint identically wherever it lands.
-            let color = color & 0x7fff;
+            // A transparent texel's colour is presentation too — the dump
+            // writes it as zero — so the fingerprint must be zero as well,
+            // or a pack built from that dump never matches the console that
+            // wrote it.
+            let color = if transparent { 0 } else { color & 0x7fff };
             byte((color & 0xff) as u8);
             byte((color >> 8) as u8);
             byte(transparent as u8);

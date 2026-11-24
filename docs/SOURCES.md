@@ -61,6 +61,6 @@ Observed behaviour is fact and is not anyone's copyrighted expression. Where
 such a decision is load-bearing it is marked in the module and covered by a
 regression test.
 
-`cpp-reference/docs/PROVENANCE.md` records a small number of behaviour-only
-compatibility facts that were originally settled with reference help rather
-than from public documentation. Those are listed there, not hidden here.
+`PROVENANCE.md` records a small number of behaviour-only compatibility facts
+that were originally settled with reference help rather than from public
+documentation. Those are listed there, not hidden here.

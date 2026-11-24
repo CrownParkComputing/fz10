@@ -79,8 +79,9 @@ They do not establish that this is a clean-room implementation, and nothing in
 this repository should be read as claiming that. The implementation was ported
 from Crown Park Computing's own C++ core, whose own development did involve
 reading Opera code as a compatibility reference. That history is set out in
-[PROVENANCE.md](PROVENANCE.md) and in `cpp-reference/docs/PROVENANCE.md`.
-Anyone assessing this project should read those too.
+[PROVENANCE.md](PROVENANCE.md), which also folds in the provenance record that
+used to live in the now-removed `cpp-reference/` tree. Anyone assessing this
+project should read it too.
 
 ## Re-running everything
 

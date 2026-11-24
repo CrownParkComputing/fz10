@@ -1,6 +1,6 @@
 //! gamecheck - boot every disc in a library, headless, and say what happened.
-//! A port of cpp-reference/tools/gamecheck so the same table can be compared
-//! core against core.
+//! A port of the retired C++ reference's gamecheck so the same table can be
+//! compared core against core.
 //!
 //!   gamecheck <bios> <library-dir> [--frames N] [--only SUBSTR] [--shots DIR] [--press]
 use std::collections::{HashMap, HashSet};

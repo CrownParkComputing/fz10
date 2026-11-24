@@ -1426,7 +1426,9 @@ mod tests {
     /// carried the static wrap could never show the full open/close cycle.
     #[test]
     fn the_case_keeps_its_disc_and_both_sleeve_panels() {
-        let case = load_case().expect("case.glb");
+        let case = load_case();
+        assert!(case.is_some(), "case.glb");
+        let Some(case) = case else { return };
         let names: Vec<&str> = case.parts.iter().map(|p| p.name.as_str()).collect();
         for part in [
             "CaseShell",

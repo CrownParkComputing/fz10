@@ -2,9 +2,10 @@
 
 This crate is a Rust rewrite of the Retro3DO C++ core (Crown Park Computing,
 MIT). The C++ reference was read as the specification; no source from any
-other emulator was used. The reference's own provenance record
-(`cpp-reference/docs/PROVENANCE.md`) applies to the hardware knowledge carried
-over and must travel with this crate.
+other emulator was used. The reference's own provenance record — shipped at
+`cpp-reference/docs/PROVENANCE.md` until that tree was removed on 2026-11-24,
+now folded into `docs/PROVENANCE.md` — applies to the hardware knowledge
+carried over and must travel with this crate.
 
 
 Repository-level provenance, the per-module source register, the

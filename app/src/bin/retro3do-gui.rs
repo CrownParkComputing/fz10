@@ -21,6 +21,8 @@ mod case_art;
 mod fz1_3d;
 #[path = "retro3do-gui/gpu_scale.rs"]
 mod gpu_scale;
+#[path = "retro3do-gui/wiki.rs"]
+mod wiki;
 #[cfg(target_os = "android")]
 #[path = "retro3do-gui/android_pad.rs"]
 mod android_pad;
@@ -246,6 +248,10 @@ struct Config {
     /// The game picture filtered smoothly on the way up to the window,
     /// instead of crisp nearest-neighbour pixels.
     smooth: bool,
+    /// Cel rasterisation scale inside the core: 1 is the real machine's
+    /// picture, `retro3do::hires::MAX_INTERNAL_SCALE` the ceiling. The core
+    /// lowers it itself rather than let fields run late.
+    internal_scale: u32,
     /// ARM work per field as a percentage of the real machine's: 100 is the
     /// real thing, up to 150 for games the hardware itself struggled with.
     cpu_scale: u32,
@@ -375,6 +381,13 @@ impl Config {
                 "media" => self.media_dir = PathBuf::from(&value),
                 "bios_file" => self.bios_choice = Some(value),
                 "smooth" => self.smooth = value == "true",
+                "internal_scale" => {
+                    self.internal_scale = value
+                        .parse()
+                        .unwrap_or(HD_INTERNAL_SCALE)
+                        .clamp(1, retro3do::hires::MAX_INTERNAL_SCALE)
+                }
+                "texdir" => self.texdir = Some(PathBuf::from(&value)),
                 "cpu_scale" => self.cpu_scale = value.parse().unwrap_or(100).clamp(100, 150),
                 "pad_primary" => self.pad_primary = value.parse().unwrap_or(0),
                 "hidden" => {
@@ -399,7 +412,8 @@ impl Config {
         }
         let text = format!(
             "games = {}\nbios = {}\nsaves = {}\nmedia = {}\nbios_file = {}\n\
-             smooth = {}\ncpu_scale = {}\npad_primary = {}\npad_bind = {}\n\
+             smooth = {}\ninternal_scale = {}\ntexdir = {}\ncpu_scale = {}\n\
+             pad_primary = {}\npad_bind = {}\n\
              hidden = {}\n",
             self.games_dir.display(),
             self.bios_dir.display(),
@@ -407,6 +421,11 @@ impl Config {
             self.media_dir.display(),
             self.bios_choice.clone().unwrap_or_default(),
             self.smooth,
+            self.internal_scale,
+            self.texdir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
             self.cpu_scale,
             self.pad_primary,
             bindings_to_text(&self.pad_bind),
@@ -436,6 +455,7 @@ impl Config {
             hidden: std::collections::HashSet::new(),
             resolve: false,
             smooth: false,
+            internal_scale: HD_INTERNAL_SCALE,
             cpu_scale: 100,
             pad_primary: 0,
             pad_bind: default_bindings(),
@@ -1209,14 +1229,16 @@ enum SettingsTab {
     Video,
     Paths,
     System,
+    Wiki,
 }
 
 /// The sections of the settings page, in the order they are listed.
-const SETTINGS_TABS: [(SettingsTab, &str, &str); 4] = [
+const SETTINGS_TABS: [(SettingsTab, &str, &str); 5] = [
     (SettingsTab::Controller, "Controller", "the pad and its buttons"),
     (SettingsTab::Video, "Video", "how the picture is drawn"),
     (SettingsTab::Paths, "Paths", "where the library lives"),
     (SettingsTab::System, "System", "the BIOS and the CPU"),
+    (SettingsTab::Wiki, "Wiki", "how this machine was written"),
 ];
 
 /// The heading at the top of a settings section.
@@ -1412,6 +1434,12 @@ struct GuiApp {
     settings_scroll: Option<f32>,
     /// The folders being typed on the settings page, applied on the button.
     set_dirs: Option<(String, String, String)>,
+    /// The texture-pack folder being typed on the settings page, applied on
+    /// the button. Empty means "probe beside the games folder".
+    texdir_edit: String,
+    /// Which of the wiki's two documents is on show: 0 is the plain-English
+    /// summary of the knowledge, 1 is the method in full.
+    wiki_page: usize,
 }
 
 /// Which title the platter wears: the disc that is in the drive, never the
@@ -1632,9 +1660,11 @@ impl GuiApp {
             field_gaps: Vec::new(),
             settings_back: View::Machine,
             settings_tab: SettingsTab::Controller,
+            wiki_page: 0,
             rebind: None,
             settings_scroll: None,
             set_dirs: None,
+            texdir_edit: String::new(),
             cfg,
         };
         app.refresh_covers();
@@ -1736,6 +1766,8 @@ impl GuiApp {
                 // A new disc is a new boot: the machine stays on show until
                 // the core is drawing again.
                 self.picture_live = false;
+                // A new title may have its own pack beside the games folder.
+                self.apply_textures();
                 if was_running {
                     self.emu.start();
                     self.emu.request_reset();
@@ -2393,6 +2425,8 @@ impl GuiApp {
                                             }
                                         }
                                     }
+                                    // The video card's texture-pack field.
+                                    14 => self.texdir_edit = chosen,
                                     _ => self.setup_media = chosen,
                                 }
                                 self.picker = None;
@@ -3466,8 +3500,27 @@ impl GuiApp {
         // Reading the art costs pixels to put it in, so the machine asks for
         // the higher internal scale; the emulator thread lowers it by itself
         // if the game cannot hold the field rate there.
-        self.emu.set_internal_scale(HD_INTERNAL_SCALE);
+        self.emu.set_internal_scale(self.cfg.internal_scale);
         self.emu.set_texture_enhance(true);
+        let dir = self.texpack_dir();
+        self.emu.set_texture_dir(dir.as_deref());
+    }
+
+    /// The texture pack in force: the configured directory when one is set,
+    /// else `texpacks/<title>` beside the games folder when that directory
+    /// exists for the title in the machine. `<title>` is the disc stem's
+    /// normalised form with the spaces out (`Road Rash (USA)` -> `roadrash`).
+    fn texpack_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.cfg.texdir {
+            return Some(dir.clone());
+        }
+        let stem = self
+            .game
+            .and_then(|g| self.games.get(g))
+            .map(|g| file_stem(&g.path))?;
+        let slug: String = normalize(&stem).replace(' ', "");
+        let dir = self.cfg.games_dir.parent()?.join("texpacks").join(slug);
+        dir.is_dir().then_some(dir)
     }
 
     // Decoded but not yet uploaded — the upload needs the egui context, which
@@ -4258,6 +4311,12 @@ impl GuiApp {
             self.cfg.bios_dir.display().to_string(),
             self.cfg.media_dir.display().to_string(),
         ));
+        self.texdir_edit = self
+            .cfg
+            .texdir
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
         self.rebind = None;
         if self.view != View::Settings {
             self.settings_back = self.view;
@@ -4452,6 +4511,7 @@ impl GuiApp {
                         SettingsTab::Video => save |= self.settings_video(ui),
                         SettingsTab::Paths => save |= self.settings_paths(ui, &mut apply),
                         SettingsTab::System => save |= self.settings_system(ui),
+                        SettingsTab::Wiki => save |= self.settings_wiki(ui),
                     }
                 });
             },
@@ -4547,6 +4607,20 @@ impl GuiApp {
             "How the machine's picture is scaled up to the window.",
         );
         settings_card(ui, "Scaling", |ui| {
+            let mut scale = self.cfg.internal_scale;
+            if ui
+                .add(
+                    egui::Slider::new(&mut scale, 1..=retro3do::hires::MAX_INTERNAL_SCALE)
+                        .suffix("x")
+                        .text("internal render scale"),
+                )
+                .changed()
+            {
+                self.cfg.internal_scale = scale;
+                self.emu.set_internal_scale(scale);
+                save = true;
+            }
+            ui.add_space(8.0);
             let mut smooth = self.cfg.smooth;
             if ui
                 .checkbox(&mut smooth, "Smooth rendering (bilinear filter)")
@@ -4558,8 +4632,57 @@ impl GuiApp {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(
-                    "Off keeps every pixel square and crisp; on blends them as the \
-                     picture is scaled up to the window.",
+                    "The scale is how many times native the cels are drawn at before \
+                     the window sees them — the enhanced picture is 2x and up, and \
+                     the core steps it down itself rather than drop frames. The \
+                     filter is how that picture reaches the window: off keeps every \
+                     pixel square and crisp; on blends them.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
+        });
+        ui.add_space(16.0);
+        settings_card(ui, "Texture pack", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Folder ").monospace());
+                let room = (ui.available_width() - 220.0).max(140.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.texdir_edit)
+                        .desired_width(room),
+                );
+                if ui.button("browse\u{2026}").clicked() {
+                    let at = self.texdir_edit.clone();
+                    self.open_picker(14, &at);
+                }
+                if ui.button("set").clicked() {
+                    let dir = self.texdir_edit.trim();
+                    self.cfg.texdir = (!dir.is_empty()).then(|| PathBuf::from(dir));
+                    self.apply_textures();
+                    save = true;
+                }
+                if ui.button("auto").clicked() {
+                    self.texdir_edit.clear();
+                    self.cfg.texdir = None;
+                    self.apply_textures();
+                    save = true;
+                }
+            });
+            ui.add_space(8.0);
+            let active = self
+                .texpack_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            ui.label(
+                egui::RichText::new(format!("In force now: {active}"))
+                    .small()
+                    .color(TEXT_DIM),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Hand-authored cel art for one game. Empty probes \
+                     texpacks/<title> beside the games folder — texpacks/roadrash \
+                     for Road Rash — and uses it when it is there.",
                 )
                 .small()
                 .color(TEXT_DIM),
@@ -4678,6 +4801,57 @@ impl GuiApp {
             );
         });
         save
+    }
+
+    /// The Wiki section: what this machine is, how it was written, and where
+    /// to read more. The words are the repository's own documents, bundled
+    /// at build time, so the app and `docs/` cannot drift apart.
+    fn settings_wiki(&mut self, ui: &mut egui::Ui) -> bool {
+        settings_head(
+            ui,
+            "Wiki",
+            "This 3DO core is brand new: written from scratch, from public \
+             documentation alone.",
+        );
+
+        let docs: [(&str, &str); 2] = [
+            ("The knowledge behind this machine", wiki::KNOWLEDGE_MD),
+            ("How it was built", wiki::CLEANROOM_MD),
+        ];
+
+        ui.horizontal(|ui| {
+            for (index, (title, _)) in docs.iter().enumerate() {
+                ui.selectable_value(&mut self.wiki_page, index, *title);
+            }
+        });
+        ui.add_space(14.0);
+
+        // The document itself.
+        let (_, text) = docs[self.wiki_page.min(docs.len() - 1)];
+        wiki::show(ui, text);
+
+        ui.add_space(20.0);
+        settings_card(ui, "Read more", |ui| {
+            for (label, url) in wiki::LINKS {
+                let response = ui.add(egui::Hyperlink::from_label_and_url(
+                    egui::RichText::new(label).color(ui.visuals().hyperlink_color),
+                    url,
+                ));
+                if response.clicked() {
+                    wiki::open_in_browser(url);
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "The links open in your browser. The wiki is the short version; \
+                     the documents in the repository are the long one.",
+                )
+                .small()
+                .color(TEXT_DIM),
+            );
+        });
+        false
     }
 
     /// Open the folder picker on a path field, starting where it points.
@@ -4883,6 +5057,28 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_page_carries_the_wiki() {
+        // The story is on the settings page, so a player can reach it.
+        let (_, name, _) = SETTINGS_TABS
+            .iter()
+            .find(|(tab, _, _)| *tab == SettingsTab::Wiki)
+            .expect("the settings page has a wiki section");
+        assert_eq!(*name, "Wiki");
+
+        // What it shows is the repository's own words, and they parse into
+        // something the app can draw.
+        for text in [wiki::KNOWLEDGE_MD, wiki::CLEANROOM_MD] {
+            assert!(!wiki::parse(text).is_empty());
+        }
+        // The story a player is told: the five cores, each named.
+        for core in ["ARM60", "CLIO", "MADAM", "DSP", "XBUS"] {
+            assert!(wiki::KNOWLEDGE_MD.contains(core), "{core} is missing");
+        }
+        // And the way out to the wiki itself.
+        assert!(wiki::LINKS.iter().any(|(_, url)| url.ends_with("/wiki")));
+    }
+
+    #[test]
     fn disc_tag_reads_the_shapes_sets_ship_as() {
         let cases = [
             ("Game (Disc 2)", "Game", 2),
@@ -4997,6 +5193,7 @@ mod tests {
             hidden: std::collections::HashSet::new(),
             resolve: false,
             smooth: false,
+            internal_scale: HD_INTERNAL_SCALE,
             cpu_scale: 100,
             pad_primary: 0,
             pad_bind: default_bindings(),
@@ -5081,6 +5278,7 @@ mod tests {
             hidden: std::collections::HashSet::new(),
             resolve: false,
             smooth: false,
+            internal_scale: HD_INTERNAL_SCALE,
             cpu_scale: 100,
             pad_primary: 0,
             pad_bind: default_bindings(),

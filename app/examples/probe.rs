@@ -33,6 +33,15 @@ fn main() -> Result<(), String> {
     let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
     let frames: u32 = arg(4).parse().unwrap_or(3000);
     let scale: u32 = arg(5).parse().unwrap_or(1);
+    // How often a frame is written, and whether the pad is left alone: the
+    // attract mode is only visible with no input, so `RETRO3DO_NO_PRESS`
+    // turns the script off and `RETRO3DO_PROBE_EVERY` samples more often.
+    let every: u32 = std::env::var("RETRO3DO_PROBE_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+        .max(1);
+    let no_press = std::env::var_os("RETRO3DO_NO_PRESS").is_some();
 
     let mut console = Console::new();
     if !console.load_bios(arg(1)) {
@@ -49,8 +58,8 @@ fn main() -> Result<(), String> {
     let started = Instant::now();
     for field in 0..frames {
         // Script: mash A early to get past logos and menus.
-        let a = field % 120 < 12 && field >= 60;
-        let play = field % 180 < 8 && field >= 120;
+        let a = !no_press && field % 120 < 12 && field >= 60;
+        let play = !no_press && field % 180 < 8 && field >= 120;
         console.pads().press(0, PadButton::A, a);
         console.pads().press(0, PadButton::Play, play);
 
@@ -59,10 +68,11 @@ fn main() -> Result<(), String> {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         costs.push(ms);
 
-        if field % 300 == 299 {
+        if field % every == every - 1 {
             let name = format!("{}/frame_{:05}.png", arg(3), field + 1);
             save_png(&console, &name)?;
-            let window = &costs[costs.len() - 300..];
+            let start = costs.len().saturating_sub(every as usize);
+            let window = &costs[start..];
             let sum: f64 = window.iter().sum();
             let decodes = console.cpu().decodes();
             println!(
@@ -70,7 +80,7 @@ fn main() -> Result<(), String> {
                 field + 1,
                 sum / window.len() as f64,
                 window.iter().cloned().fold(0.0f64, f64::max),
-                (decodes - prev_decodes) as f64 / 300.0,
+                (decodes - prev_decodes) as f64 / every as f64,
             );
             prev_decodes = decodes;
         }

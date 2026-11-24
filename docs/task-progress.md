@@ -231,5 +231,103 @@ are back, `slept.png` five seconds on they are gone again.
   sit on the BIOS "Insert CD" screen. The CHD dump of the same disc boots.
 - AI Deck `ready.json`: `retro3do-rs`, state `TEST`, launch
   `/home/jon/retro3do-rs/launch-road-rash.sh` (chmod +x), args `[]`, cwd repo.
-  Wrapper execs `retro3do-sdl --bios panafz10.bin --disc "Road Rash (USA).chd"`;
+  Wrapper execs `retro3do-gui --games-dir /home/jon/3do-library/games --bios-dir /home/jon/3do-library/bios` (the SDL front end is gone);
   launch checked with a 10 s timeout — renderer `vulkan`, no errors.
+
+## 9. Retail boot milestone re-verified — DONE (2026-11-24)
+Road Rash (USA).chd on panafz10.bin reaches input-driven gameplay end-to-end.
+Re-ran the whole chain on the current tree (no source changes needed):
+- `cargo build --release`: clean. `cargo test --bin retro3do-gui`: 28/28 pass.
+- `probe panafz10.bin "Road Rash (USA).chd" ~/ai-scratch/3do-retail 2700`:
+  frame_01200 = title screen ("ROAD RASH — Presented in DOLBY SURROUND"),
+  frame_02400 = in-race 3D street with HUD (Player 1 / speed / Buzz).
+  301.7 fields/s unthrottled, mean 3.31 ms/field.
+- `in_game_check` (the threaded paced path front ends use, scripted A/Play taps
+  through the menus): **59.97 fields/s, 0 late fields, 0 deadline resets**,
+  final frame = live race (`~/ai-scratch/3do-retail/ingame.png`).
+Evidence dir: `~/ai-scratch/3do-retail/` (probe frames + ingame.png + logs).
+Known gap (unchanged): `~/3do-work/rr3do.iso` raw ISO still sits on the BIOS
+"Insert CD" screen; the CHD dump of the same disc is the working path.
+No commits made, per scope.
+
+## 10. Consolidation epic — old paths removed, graphics wired, clean-room docs written (2026-11-24)
+
+**Item 1 — old paths gone (clean-room only).** `cpp-reference/` (the
+Opera-knowledge C++ core) is deleted from the tree; `app/src/bin/retro3do-sdl.rs`
+is deleted, so the SDL front end is no longer a bin target — `app/src/bin/` now
+holds only `retro3do-gui.rs`. `launch-road-rash.sh` execs `retro3do-gui` with
+`--games-dir`/`--bios-dir`. The last two doc references to `retro3do-sdl`
+(PLAN.md Milestone 1b, and the item-8 wrapper note above) were retargeted so no
+stale name survives. `docs/PROVENANCE.md` records that the C++ tree was read as
+reference but no longer ships; `docs/CLEANROOM.md` (new) tells the whole
+documentation-driven method, and `README.md` links it.
+
+**Item 2 — graphics options live.** The dead texpack path is now wired:
+`apply_textures()` in `app/src/bin/retro3do-gui.rs` calls
+`emu.set_texture_dir(dir.as_deref())` on every apply, where `texpack_dir()`
+returns the configured `--texdir`/`RETRO3DO_TEXDIR` directory when set, else
+probes `texpacks/<title>` beside the games folder (disc stem normalised, spaces
+out — `Road Rash (USA)` -> `roadrash`). The settings pane exposes internal
+render scale, smooth filter, the 100–150 % `cpu_scale` slider and the texture
+pack directory field with a folder picker; the enhanced path (2x internal +
+enhance) is on by default, so enhanced graphics are the out-of-the-box
+experience rather than a hidden opt-in.
+
+**Item 3 — documentation.** `docs/CLEANROOM.md` (132 lines) covers: which
+public spec each hardware module follows (pulled from `docs/SOURCES.md`), the
+knowledge lineage (FreeDO/Opera knowledge -> the C++ core as spec of record ->
+this Rust crate, all read-only as reference), the audit method
+(`docs/audit.sh` + `docs/AUDIT.md`), and what a reader needs to reproduce the
+methodology. The repo now stands on its own without `cpp-reference/` present.
+
+**Item 4 — video path.** The complete video path is the VDLP field walk plus
+the CEL pixel decoder (`app/src/madam/decoder.rs`, the pixel processor of
+WO 94/10644: PLUT selection, per-channel AMV multipliers, transparency, saved
+V/H bits) plus the internal-scale/enhance/scaler stages. Evidence from the
+milestone-9 run on this tree: `probe` frame_01200 = Road Rash title screen,
+frame_02400 = in-race 3D street with HUD, at 59.97 fields/s with 0 late fields
+and 0 deadline resets (`~/ai-scratch/3do-retail/`). On Cinepak specifically:
+the 3DO's CEL engine has no Cinepak mode — Cinepak cels are decoded by the
+ARM60 running the game's own decoder (the SDK shipped one), so there is no
+hardware decoder to emulate and the FMV path is an ARM60-correctness question,
+not a missing-codec question; `~/3do-work/cinepak.c`, `cinepak3do.py` and
+`cpk.txt` are the prior research reference for that format. This session did
+not re-run a dedicated FMV capture, so the item-4 claim rests on the milestone-9
+gameplay evidence plus the format reading above, not on a fresh FMV frame.
+
+Verification on the finished tree:
+- `cargo build --release`: clean. `cargo test`: 398/398 pass
+  (`cargo test --bin retro3do-gui`: 28/28; `cargo test --test texpack`: 3/3).
+- `cargo clippy --all-targets -- -D warnings`: clean. One test-only
+  `expect("case.glb")` in `fz1_3d.rs` was replaced with an assertion to get
+  there.
+- `bash docs/audit.sh`: all four checks pass; 51 Rust files, 398 `#[test]`
+  functions.
+- `launch-road-rash.sh` smoke in the real window: the shelf screenshot path
+  works, `load:road rash` resolves the title and reaches the boot sequence,
+  and the scripted close exits cleanly (`/tmp/r3smoke/{shelf,boot}.png`,
+  `/tmp/retro3do-{launch,load}.log`).
+- `hires_shot panafz10.bin "Road Rash (USA).chd" 2400 60 2
+  /tmp/r3smoke/roadrash-2x.png`: 1280x960 live-race frame, 11.38 ms/field
+  mean, 2 hi-res surfaces — the 2x/enhanced path exercised on the retail
+  disc, not just compiled.
+- `cargo fmt --check` remains noisy across the pre-existing tree (thousands
+  of unrelated diffs), so it was not used as this item's gate.
+
+No commits made, per scope.
+
+**Item 5 — in-app knowledge surface (tester feedback 2026-11-24).**
+`retro3do-gui/wiki.rs` bundles `docs/KNOWLEDGE.md` (player summary + per-core
+public specs) and `docs/CLEANROOM.md` (method) via `include_str!`, so app text
+and docs cannot drift. The settings page carries a `SettingsTab::Wiki` with
+page selector + five clickable hyperlinks to `github.com/CrownParkComputing/fz10`
+(`/wiki` and the four docs). Reuses the existing docs-dir pattern's Markdown
+reader. Re-verified this session: `cargo test` 407/407 pass (was 398 — the wiki
+tests added), release binary rebuilt fresh after all sources.
+
+Final re-verification (2026-11-24, fresh session): `cargo test` in `app/`
+ran 407 tests across all suites — 0 failed. Disk state confirmed: `docs/CLEANROOM.md`
++ `docs/KNOWLEDGE.md` present, README links CLEANROOM.md, `docs/PROVENANCE.md`
+records the `cpp-reference/` removal (lines 37-38, 109-110), `cpp-reference/`
+and `app/src/bin/retro3do-sdl.rs` absent from the tree, `wiki.rs` (in-app
+knowledge surface) present with its link set. No commits made, per scope.
